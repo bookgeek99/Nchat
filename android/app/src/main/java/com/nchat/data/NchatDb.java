@@ -301,6 +301,126 @@ public class NchatDb extends SQLiteOpenHelper {
         return d;
     }
 
+    // ==================== 统计（为将来的智能判断积累样本） ====================
+
+    /** 某一决策类型的总次数 */
+    public int countByType(int type) {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*) FROM decisions WHERE type=?",
+                new String[]{String.valueOf(type)})) {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        }
+    }
+
+    /** 某类型在 since 之后的次数 */
+    public int countByTypeSince(int type, long since) {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*) FROM decisions WHERE type=? AND decided_at>=?",
+                new String[]{String.valueOf(type), String.valueOf(since)})) {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        }
+    }
+
+    /** 全部决策总数 */
+    public int countAll() {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*) FROM decisions", null)) {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        }
+    }
+
+    /** 单行统计结果：类型 → 计数 */
+    public static class TypeCount {
+        public int type;
+        public int count;
+        public TypeCount(int type, int count) { this.type = type; this.count = count; }
+    }
+
+    /** 按类型分组统计（since 之后），用于统计页饼图/列表 */
+    public List<TypeCount> statsByType(long since) {
+        List<TypeCount> list = new ArrayList<>();
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT type, COUNT(*) AS n FROM decisions WHERE decided_at>=? "
+                        + "GROUP BY type ORDER BY n DESC",
+                new String[]{String.valueOf(since)})) {
+            while (c.moveToNext()) list.add(new TypeCount(c.getInt(0), c.getInt(1)));
+        }
+        return list;
+    }
+
+    /** 单行统计：某个渠道（pkg+渠道名）的决策分布，用于将来判断"该不该屏蔽这个渠道" */
+    public static class ChannelStat {
+        public String pkg;
+        public String channelName;
+        public int total;
+        public int seen;      // 已阅
+        public int ignore;    // 不感兴趣
+        public int done;      // 已完成
+        public int later;     // 稍后读/稍后办
+        /** 负面占比：不感兴趣 / 总数 */
+        public float negativeRatio() {
+            return total <= 0 ? 0f : (float) ignore / total;
+        }
+    }
+
+    /**
+     * 按渠道聚合决策分布。
+     * 这是「将来做智能判断」的基础数据：
+     * 如果某个渠道的 ignore 占比长期很高，就可以建议用户直接屏蔽它。
+     */
+    public List<ChannelStat> statsByChannel(int minTotal) {
+        List<ChannelStat> list = new ArrayList<>();
+        String sql = "SELECT pkg, channel_name, type, COUNT(*) AS n FROM decisions "
+                + "GROUP BY pkg, channel_name, type";
+        java.util.LinkedHashMap<String, ChannelStat> map = new java.util.LinkedHashMap<>();
+        try (Cursor c = getReadableDatabase().rawQuery(sql, null)) {
+            while (c.moveToNext()) {
+                String pkg = c.getString(0);
+                String ch = c.getString(1);
+                int type = c.getInt(2);
+                int n = c.getInt(3);
+                String k = pkg + "\u0001" + ch;
+                ChannelStat st = map.get(k);
+                if (st == null) {
+                    st = new ChannelStat();
+                    st.pkg = pkg;
+                    st.channelName = ch;
+                    map.put(k, st);
+                }
+                st.total += n;
+                switch (type) {
+                    case Decision.TYPE_SEEN:  st.seen += n; break;
+                    case Decision.TYPE_IGNORE: st.ignore += n; break;
+                    case Decision.TYPE_DONE:  st.done += n; break;
+                    case Decision.TYPE_READ_LATER:
+                    case Decision.TYPE_DO_LATER: st.later += n; break;
+                    default: break;
+                }
+            }
+        }
+        for (ChannelStat st : map.values()) {
+            if (st.total >= minTotal) list.add(st);
+        }
+        // 负面占比高的排前面 —— 最可能是"该屏蔽"的渠道
+        java.util.Collections.sort(list, (a, b) ->
+                Float.compare(b.negativeRatio(), a.negativeRatio()));
+        return list;
+    }
+
+    /** 小时分布：一天中哪个时段收到的通知最多（0-23） */
+    public int[] hourHistogram() {
+        int[] h = new int[24];
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT CAST(strftime('%H', decided_at/1000, 'unixepoch', 'localtime') AS INTEGER) AS h, "
+                        + "COUNT(*) FROM decisions GROUP BY h", null)) {
+            while (c.moveToNext()) {
+                int idx = c.getInt(0);
+                if (idx >= 0 && idx < 24) h[idx] = c.getInt(1);
+            }
+        }
+        return h;
+    }
+
     // ==================== 应用分类记忆 ====================
 
     public void setPkgRule(String pkg, NotifCategory cat, boolean fromUser) {

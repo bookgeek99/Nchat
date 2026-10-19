@@ -40,5 +40,9 @@
             android:name=".ui.HistoryActivity"
             android:exported="false"
             android:label="通知历史" />
+        <activity
+            android:name=".ui.StatsActivity"
+            android:exported="false"
+            android:label="使用统计" />
     </application>
 </manifest>

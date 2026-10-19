@@ -50,6 +50,16 @@
             android:padding="11dp" />
 
         <ImageButton
+            android:id="@+id/btnStats"
+            android:layout_width="42dp"
+            android:layout_height="42dp"
+            android:layout_marginStart="8dp"
+            android:background="@drawable/bg_button_ghost"
+            android:src="@android:drawable/ic_menu_sort_by_size"
+            android:contentDescription="统计"
+            android:scaleType="centerInside"
+            android:padding="11dp" />
+        <ImageButton
             android:id="@+id/btnRefresh"
             android:layout_width="42dp"
             android:layout_height="42dp"
@@ -258,7 +268,7 @@
             android:id="@+id/rowSecondary"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical" />
+            android:orientation="horizontal" />
     </LinearLayout>
 
         <!-- 状态提示条：高度固定 22dp，永远占位。

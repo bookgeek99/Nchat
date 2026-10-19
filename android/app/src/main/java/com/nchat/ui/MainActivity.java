@@ -47,7 +47,7 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout layoutEmpty, layoutNeedSetup, layoutActions, rowPrimary, rowSecondary, layoutBottom;
     private TextView tvProgressTitle, tvProgressSub, tvEmptyTitle, tvEmptyHint, tvSetupDesc, tvAiStatus, tvEmptyIcon;
     private ProgressBar progressBar;
-    private ImageButton btnRefresh, btnSettings, btnHistory;
+    private ImageButton btnRefresh, btnSettings, btnHistory, btnStats;
     private LinearLayout rowChannel;
     private TextView tvChannelName, tvChannelState;
     private androidx.appcompat.widget.SwitchCompat swChannel;
@@ -111,6 +111,7 @@ public class MainActivity extends AppCompatActivity {
         btnSettings = findViewById(R.id.btnSettings);
         btnSetup = findViewById(R.id.btnSetup);
         btnHistory = findViewById(R.id.btnHistory);
+        btnStats = findViewById(R.id.btnStats);
         rowChannel = findViewById(R.id.rowChannel);
         tvChannelName = findViewById(R.id.tvChannelName);
         tvChannelState = findViewById(R.id.tvChannelState);
@@ -154,6 +155,8 @@ public class MainActivity extends AppCompatActivity {
         btnSettings.setOnClickListener(v ->
                 startActivity(new Intent(this, SettingsActivity.class)));
         btnSetup.setOnClickListener(v -> doSetup());
+        btnStats.setOnClickListener(v ->
+                startActivity(new android.content.Intent(this, StatsActivity.class)));
         btnHistory.setOnClickListener(v ->
                 startActivity(new Intent(this, HistoryActivity.class)));
     }
@@ -634,8 +637,11 @@ public class MainActivity extends AppCompatActivity {
         addPrimary(laterLabel, 0xFF23324A, () -> doLater(it, cat == NotifCategory.INFO
                 ? Decision.TYPE_READ_LATER : Decision.TYPE_DO_LATER));
 
-        // 第三个：收尾（所有分类统一）
-        addSecondary("不感兴趣", 0xFF3A1F24, 0xFFFF7A8A, () -> doIgnore(it));
+        // 第三行：已阅 + 不感兴趣，两个按钮并排一行
+        addSecondaryRow(new String[]{"已阅", "不感兴趣"},
+                new int[]{0xFF23324A, 0xFF3A1F24},
+                new int[]{0xFFB0C4DE, 0xFFFF7A8A},
+                new Runnable[]{() -> doSeen(it), () -> doIgnore(it)});
 
         // 所有按钮加完后统一重排一次（分散的 requestLayout 会让子 View 停在 0x0）
         layoutActions.post(() -> {
@@ -695,6 +701,41 @@ public class MainActivity extends AppCompatActivity {
         rowSecondary.addView(makeBtn(text, bgColor, textColor, r, false));
     }
 
+    /**
+     * 一行并排放多个按钮（横向等分）。
+     * 用于「已阅 | 不感兴趣」这一行 —— 这两个都是「收尾类」操作，
+     * 语义上并列，没必要各占一整行。
+     */
+    private void addSecondaryRow(String[] texts, int[] bgs, int[] fgs, Runnable[] actions) {
+        int side = dp(18);
+        int gap = dp(8);
+        int n = texts.length;
+        int total = getResources().getDisplayMetrics().widthPixels - side * 2;
+        int w = (total - gap * (n - 1)) / n;
+        int h = dp(46);
+        for (int i = 0; i < n; i++) {
+            TextView tv = new TextView(this);
+            tv.setText(texts[i]);
+            tv.setTextSize(14);
+            tv.setTextColor(fgs[i]);
+            tv.setGravity(android.view.Gravity.CENTER);
+            GradientDrawable d = new GradientDrawable();
+            d.setCornerRadius(dp(13));
+            d.setColor(bgs[i]);
+            d.setStroke(dp(1), 0x22FFFFFF);
+            tv.setBackground(d);
+            tv.setSingleLine(true);
+            tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, h);
+            lp.topMargin = dp(7);              // 与上一行按钮保持统一间距
+            if (i > 0) lp.leftMargin = gap;    // 并排按钮之间的横向间隙
+            tv.setLayoutParams(lp);
+            final Runnable r = actions[i];
+            tv.setOnClickListener(v -> r.run());
+            rowSecondary.addView(tv);
+        }
+    }
+
     private TextView makeBtn(String text, int bg, int fg, Runnable r, boolean flex) {
         TextView tv = new TextView(this);
         tv.setText(text);
@@ -714,8 +755,9 @@ public class MainActivity extends AppCompatActivity {
         int w = getResources().getDisplayMetrics().widthPixels - side * 2;
         int h = dp(flex ? 46 : 42);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, h);
-        // 三个按钮各占一行，纵向排列，只保留上间距
-        if (rowPrimary.getChildCount() > 0 || rowSecondary.getChildCount() > 0) {
+        // rowPrimary 内按钮纵向排列：第一个顶格，其余留上间距。
+        // （rowSecondary 的并排按钮由 addSecondaryRow 自己管间距）
+        if (rowPrimary.getChildCount() > 0) {
             lp.topMargin = gap;
         }
         tv.setLayoutParams(lp);
@@ -804,6 +846,28 @@ public class MainActivity extends AppCompatActivity {
             DaemonClient.cancel(it.key);
             ui.post(() -> {
                 recordDecision(it, Decision.TYPE_DONE, false, false);
+                advance();
+            });
+        });
+    }
+
+    /**
+     * 已阅：内容看到了就够，不需要点进去，但也不是「不感兴趣」。
+     * 行为上和「已完成」一致（从通知栏清除 + 记一条 TYPE_SEEN），
+     * 区别只在类型 —— 将来做智能判断时，
+     * 「已阅」是中性/正向样本，「不感兴趣」是负样本，必须分开统计。
+     */
+    private void doSeen(NotifItem it) {
+        if (it.fromTodo) {
+            markTodoFinished(it);
+            recordDecision(it, Decision.TYPE_SEEN, false, true);
+            advance();
+            return;
+        }
+        io.execute(() -> {
+            DaemonClient.cancel(it.key);
+            ui.post(() -> {
+                recordDecision(it, Decision.TYPE_SEEN, false, false);
                 advance();
             });
         });
