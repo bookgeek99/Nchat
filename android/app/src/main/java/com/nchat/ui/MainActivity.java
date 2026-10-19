@@ -243,6 +243,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        // 离开前台 = 目标 App 已经起来了，跳转成功。
+        // 这里推进卡片（而不是在 doReadNow 里 advance），
+        // 否则我们一重排就把刚起来的 App 压回去了。
+        if (pendingJump) {
+            confirmJumpIfPending();
+            advance();
+        }
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         // 从设置页返回时可能配了 AI
@@ -737,23 +749,48 @@ public class MainActivity extends AppCompatActivity {
                 }
                 recordDecision(it, Decision.TYPE_DONE, false, true);
 
-                // 跳转后延迟推进卡片：目标 App 需要时间切前台，
-                // 立刻 advance() 的话我们的重排会把它压回去，看起来像"没反应"。
-                // 同事后校验：如果 2.5 秒后我们仍在前台，说明这条通知的
-                // contentIntent 其实打不开（典型：常驻播放类通知指向内部播放页），
-                // 给用户一个明确提示，而不是让他以为点了没反应。
-                ui.postDelayed(() -> {
-                    if (isFinishing() || isDestroyed()) return;
-                    if (!isSelfForeground()) {
-                        // 已经切到别的 App，正常推进
-                        advance();
-                    } else {
-                        toast("这条通知本身无法跳转（可能是常驻/播放类通知）");
-                        advance();
-                    }
-                }, 2500);
+                // 跳转后不立刻 advance()：目标 App 需要时间切前台，
+                // 我们一重排就会把它压回去，看起来像"没反应"。
+                //
+                // 判断跳转是否成功，**不能**用 isSelfForeground() 轮询 ——
+                // getRunningAppProcesses() 在 Android 7+ 对普通应用只返回自己的进程，
+                // 于是这个判断恒定"我还在前台"，大量正常通知被误报成
+                // 「可能是常驻/播放类」。
+                //
+                // 可靠做法：目标 App 起来时我们必然收到 onPause/onStop，
+                // 所以置一个 pendingJump 标记，由生命周期回调来确认成功；
+                // 只有超时后仍没收到 onPause 才判定为真的跳不出去。
+                pendingJump = true;
+                pendingJumpItem = it;
+                ui.postDelayed(jumpCheckRunnable, JUMP_TIMEOUT_MS);
             });
         });
+    }
+
+    /** 等待 onPause 确认跳转成功的超时（冷启动 + WebView 首帧可能较慢） */
+    private static final long JUMP_TIMEOUT_MS = 6000;
+    private boolean pendingJump = false;
+    private NotifItem pendingJumpItem;
+
+    private final Runnable jumpCheckRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!pendingJump) return;
+            pendingJump = false;
+            pendingJumpItem = null;
+            if (isFinishing() || isDestroyed()) return;
+            // 到点仍没离开过本界面，说明 contentIntent 确实打不开
+            toast("这条通知打不开（没有可跳转的页面）");
+            advance();
+        }
+    };
+
+    /** 离开前台即视为跳转成功，清掉待定状态并推进卡片 */
+    private void confirmJumpIfPending() {
+        if (!pendingJump) return;
+        pendingJump = false;
+        pendingJumpItem = null;
+        ui.removeCallbacks(jumpCheckRunnable);
     }
 
     private void doDone(NotifItem it) {
@@ -1010,24 +1047,6 @@ public class MainActivity extends AppCompatActivity {
             renderActionsFor(next);
         }
         updateProgress();
-    }
-
-    /** 判断当前前台应用是否还是自己（用于校验跳转是否真的生效） */
-    private boolean isSelfForeground() {
-        try {
-            android.app.ActivityManager am =
-                    (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
-            java.util.List<android.app.ActivityManager.RunningAppProcessInfo> list =
-                    am.getRunningAppProcesses();
-            if (list == null) return true;
-            for (android.app.ActivityManager.RunningAppProcessInfo pi : list) {
-                if (pi.importance == android.app.ActivityManager.RunningAppProcessInfo
-                        .IMPORTANCE_FOREGROUND) {
-                    return pi.processName != null && pi.processName.startsWith(getPackageName());
-                }
-            }
-        } catch (Throwable ignore) {}
-        return true;
     }
 
     private void toast(String s) {

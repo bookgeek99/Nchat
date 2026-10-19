@@ -470,6 +470,98 @@ milink.service / tsmclient / securitycenter / aicr）。
 - 推送：`git push https://bookgeek99:TOKEN@github.com/bookgeek99/Nchat.git main`
   （token 只用在命令行，绝不写进 remote）
 
+
+## 第九轮：点击误报 + 常驻通知漏过滤
+
+用户反馈两个现象，其实是**同一个改动引发的两个方向的问题**。
+
+### 现象 A：点 IT之家新闻，提示「可能打不开 / 是音频或常驻」
+先查数据，那条通知完全正常：
+```
+key      = 0|com.ruanmei.ithome|43250940|null|10399
+hasIntent= true     ongoing = false    clearable = true
+category = null     noisy   = false    flags = 16
+```
+再用 daemon 直接测 `/click`，**1 秒内就跳进了**
+`com.ruanmei.ithome/.ui.NewsInfoV8Activity`（新闻详情页）。
+
+所以跳转链路是好的，问题在 App 侧的**结果校验**：
+
+```java
+// 旧代码
+if (!isSelfForeground()) { advance(); }
+else { toast("这条通知本身无法跳转（可能是常驻/播放类通知）"); }
+```
+
+```java
+private boolean isSelfForeground() {
+    List<RunningAppProcessInfo> list = am.getRunningAppProcesses();
+    for (pi : list) if (pi.importance == IMPORTANCE_FOREGROUND)
+        return pi.processName.startsWith(getPackageName());
+    return true;
+}
+```
+
+**`getRunningAppProcesses()` 从 Android 7 起对普通应用只返回自己的进程**，
+循环永远命中自己 → 恒定返回 true → **每一条通知都会被误报成"打不开"**。
+这个校验从加进来那天起就和没写一样，只是以前几乎没人点"立即阅读"所以没暴露。
+
+**修法**：不用任何轮询。目标 App 起来时我们必然收到 `onPause`，
+用生命周期回调来确认，反而最可靠：
+- `doReadNow()` 里置 `pendingJump = true`，`postDelayed(jumpCheckRunnable, 6000)`
+- `onPause()` 里：`if (pendingJump) { confirmJumpIfPending(); advance(); }`
+- 超时仍未 onPause 才提示「这条通知打不开（没有可跳转的页面）」
+- 超时从 2.5s 放宽到 6s（冷启动 + WebView 首帧可能慢）
+- 删掉 `isSelfForeground()`
+
+顺带解决了一个老问题：以前一 `recordDecision` 就 `advance()`，
+我们的重排会把刚起来的 App 压回去；现在推进放在 `onPause` 之后，不会打架。
+
+### 现象 B：Operit 的常驻通知被显示出来，一点就跳回 Operit
+
+上一轮为了修「通知不全」，把 `isNoisy()` 里的 `sbn.isOngoing()` 一刀切删掉了。
+但 Operit 那条是：
+```
+ongoing = true     clearable = false     flags = 2
+title   = 长门     text = 运行对话 1 · 调用工具 0
+```
+`flags = 2` 正是 `FLAG_ONGOING_EVENT`。删掉 ongoing 判断后它就漏进来了，
+而它的 `contentIntent` 指向 Operit 主界面，所以点了就跳回去。
+
+**正确的信号是 `sbn.isClearable()`，不是 `isOngoing()`**：
+
+| 判断依据 | 可靠性 |
+|---|---|
+| `isOngoing()` | 差 —— 大量普通推送也带这个标记（48 条里 14 条有） |
+| `isClearable()` | 好 —— **用户划不掉 = 一定是常驻服务**，没有例外 |
+
+两处同时改：
+- daemon `isNoisy()`：`if (!sbn.isClearable()) return true;`
+- App `NotifItem.isPersistent()`：`if (!clearable) return true;`（兜底，防 daemon jar 没同步）
+
+**实测过滤效果**（48 条原始通知）：
+
+被 `clearable=false` 拦下 15 条，全是常驻服务：
+```
+android                        LSPosed 已加载
+com.gorillasoftware.everyproxy Every Proxy
+com.xiaomi.aicr                (HyperAI)
+com.xiaomi.mi_connect_service  扫描设备 / 互联通信服务 / Continuity / Networking
+com.milink.service             全场景音乐服务 / subSystem
+com.miui.tsmclient             钱包
+com.xiaomi.mirror              "跨屏协同服务"正在运行
+com.miui.securitycenter        安全辅助通知
+com.ai.assistance.operit       长门
+```
+**没有一条普通推送被误伤**。最终 48 → 25 条待处理。
+
+### 验证方法上的教训
+`uiautomator dump` 和每次工具调用都会把 Operit 拉到前台，
+导致 `input tap` 落在 Operit 上而不是 App 上，盲点坐标还经常点到别的按钮
+（有几次点成了「不感兴趣」，DB 里能看到 type=4 的记录）。
+**验证 App 内交互时，直接用 daemon 的 HTTP 接口测底层能力（/click /state），
+比在界面上点按钮可靠得多**。
+
 ## 构建命令
 ```bash
 ./buildall.sh

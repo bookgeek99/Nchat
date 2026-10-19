@@ -81,6 +81,12 @@ public class NotifItem {
         // 真正该过滤的只有 daemon 判定的系统/常驻类（noisy），
         // 以及明确的媒体播放通道。
         if ("transport".equals(category)) return true;
+        // 用户划不掉的通知 = 常驻/前台服务通知。
+        // 这类通知的任务就是「一直挂在那儿」，不是等你处理的东西；
+        // 而且它们的 contentIntent 通常指向自己 App 的主界面，
+        // 点一下只会跳回那个 App（点了 Operit 的常驻通知就跳回 Operit）。
+        // clearable 比 ongoing 可靠：ongoing 很多普通推送也带，clearable=false 一定是常驻。
+        if (!clearable) return true;
         // 播放/媒体类常驻通知：点「立即阅读」只会回到播放页或干脆没反应，直接不进决策流
         if (ongoing && channelName != null
                 && MEDIA_CHANNEL.matcher(channelName).find()) return true;

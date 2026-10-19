@@ -520,6 +520,14 @@ public class NchatDaemon {
         // 系统进程自身的杂项通知
         if ("android".equals(pkg) || "com.android.systemui".equals(pkg)) return true;
 
+        // 【最强信号】用户划不掉的通知 = 常驻服务/前台服务。
+        // 这类通知本来就该一直挂在那里，不属于「待处理」的范畴；
+        // 而且它们通常 contentIntent 指向自己的主界面，
+        // 点一下只会跳回那个 App（比如点了 Operit 的常驻通知就跳回 Operit），
+        // 对用户毫无意义。sbn.isClearable() 比 isOngoing() 可靠得多 ——
+        // ongoing 标记很多普通推送也会带，而 clearable=false 一定是常驻。
+        if (!sbn.isClearable()) return true;
+
         // 明确的媒体传输 / 前台服务类
         if (Notification.CATEGORY_TRANSPORT.equals(n.category)) return true;
         if (Notification.CATEGORY_SERVICE.equals(n.category)) return true;
