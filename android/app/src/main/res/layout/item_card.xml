@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  外层 FrameLayout 必须 match_parent：ViewPager2 强制要求每个 page 撑满，
+  否则抛 IllegalStateException("Pages must fill the whole ViewPager2")。
+  卡片本体 height=wrap_content 并居中，内容少时卡片自然变矮，
+  不再顶满整屏、把下方三个操作按钮挤到屏幕边缘。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_vertical"
+        android:layout_margin="18dp"
+        android:orientation="vertical"
+        android:background="@drawable/bg_card"
+        android:padding="24dp">
+
+    <!-- 顶栏：图标 + 应用名 + 时间 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:id="@+id/ivIcon"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:contentDescription="图标" />
+
+        <TextView
+            android:id="@+id/tvAppName"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp"
+            android:singleLine="true"
+            android:ellipsize="end"
+            android:text="应用名" />
+
+        <TextView
+            android:id="@+id/tvTime"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            style="@style/MetaText"
+            android:text="14:20" />
+    </LinearLayout>
+
+    <!-- 分类条 + 渠道名 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <View
+            android:id="@+id/vCatBar"
+            android:layout_width="4dp"
+            android:layout_height="16dp"
+            android:background="@drawable/bg_cat_bar" />
+
+        <TextView
+            android:id="@+id/tvCategory"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:textColor="@color/cat_info"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:text="信息" />
+
+        <TextView
+            android:id="@+id/tvChannel"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            style="@style/MetaText"
+            android:singleLine="true"
+            android:ellipsize="end"
+            android:text="" />
+    </LinearLayout>
+
+    <!-- 标题 -->
+    <TextView
+        android:id="@+id/tvTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="18dp"
+        style="@style/CardTitle"
+        android:text="通知标题" />
+
+    <!-- 正文（可滚动） -->
+    <!-- 正文限高：内容少时自适应，多时在 150dp 内滚动，避免卡片把整屏撑满 -->
+    <com.nchat.widget.MaxHeightScrollView
+        android:id="@+id/svBody"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:maxHeight="150dp"
+        android:layout_marginTop="12dp"
+        android:scrollbars="none">
+
+        <TextView
+            android:id="@+id/tvBody"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            style="@style/CardBody"
+            android:text="" />
+    </com.nchat.widget.MaxHeightScrollView>
+
+    <!-- 原通知快捷操作 -->
+    <HorizontalScrollView
+        android:id="@+id/hsvActions"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:scrollbars="none"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/llNotifActions"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal" />
+    </HorizontalScrollView>
+
+</LinearLayout>
+</FrameLayout>

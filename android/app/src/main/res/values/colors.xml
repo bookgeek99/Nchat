@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色基底 -->
+    <color name="bg">#0B0D12</color>
+    <color name="surface">#151922</color>
+    <color name="surface_high">#1E2430</color>
+    <color name="stroke">#2A3242</color>
+
+    <!-- 文字 -->
+    <color name="text_primary">#F0F3F8</color>
+    <color name="text_secondary">#9AA5B8</color>
+    <color name="text_tertiary">#5E6B80</color>
+
+    <!-- 分类色：信息=青 / 营销=橙 / 工具=绿 / 其他=紫 -->
+    <color name="cat_info">#38D9D9</color>
+    <color name="cat_marketing">#FFA23A</color>
+    <color name="cat_tool">#4ADE80</color>
+    <color name="cat_other">#A78BFA</color>
+
+    <!-- 操作按钮 -->
+    <color name="btn_ghost">#202634</color>
+    <color name="btn_danger">#3A1F24</color>
+    <color name="btn_danger_text">#FF7A8A</color>
+    <color name="accent">#5B8DEF</color>
+</resources>

@@ -1,0 +1,40 @@
+# ---- 构建产物 ----
+build/
+android/app/build/
+android/build/
+android/.gradle/
+.gradle/
+*.apk
+*.aab
+*.dex
+classes/
+
+# daemon jar 由 buildall.sh 从 daemon-src 编译生成，不入库
+android/app/src/main/assets/nchatd.jar
+
+# ---- Android / Gradle ----
+local.properties
+android/local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ---- 签名密钥（含密码，绝不入库） ----
+android/keystore/
+*.jks
+*.keystore
+*.p12
+
+# ---- 临时调试目录 ----
+ht/
+st/
+httptest/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.swp
