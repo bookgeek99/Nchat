@@ -418,6 +418,58 @@ milink.service / tsmclient / securitycenter / aicr）。
 同时 `settings put system screen_brightness 200` 提亮，即可夺回焦点。
 教训：不要用电源键做唤醒循环，改用 `am start -W` 直接冷启动验证。
 
+
+## 第八轮：按钮结构统一 + 布局去抖动 + GitHub
+
+### 1. 补上「打开 / 去处理」按钮
+原来只有 `INFO` 和 `MARKETING` 分支有打开按钮，`TOOL` 和 `default` 分支都没有。
+遇到工具类通知（如充电、系统设置类）想直接跳去 App 处理，无路可走。
+
+重构成**统一的按钮结构**，每个分类都保证三个按钮：
+
+| 位置 | 有 contentIntent | 无 contentIntent（待办还原 / 通知无可跳转目标） |
+|---|---|---|
+| 第 1 个 | 立即阅读 / 立即去办 / 去处理 / 打开通知 | 已完成（TOOL/OTHER）或 标记已读 |
+| 第 2 个 | 稍后读 / 稍后办 | 同左 |
+| 第 3 个 | 不感兴趣 | 同左 |
+
+`canOpen = it.hasIntent && !it.fromTodo` —— 从待办还原的条目原通知已不在通知栏，
+跳转必然失败，所以退化为主操作按钮。
+
+### 2. 「不感兴趣」按钮间距不一致
+`rowSecondary` 在 XML 里带了 `android:layout_marginTop="8dp"`，
+而 `makeBtn()` 内部又给每个按钮加了 `topMargin = 7dp`。
+两者叠加 → 第 3 个按钮与上面的间距是 15dp，而 1→2 之间只有 7dp。
+
+**修法**：去掉容器上的 `marginTop`，间距统一由 `makeBtn` 的 `topMargin` 管理。
+实测三个按钮 y 坐标：1976-2125、2147-2296、2318-2454，间距均为 22px。
+
+### 3. 底部提示条高度不固定导致按钮抖动
+`tvAiStatus` 原本是 `wrap_content` + `visibility="gone"`。
+代码里在 AI 分析开始/结束时会 `setVisibility(VISIBLE/GONE)` 切换，
+高度在 0 和 ~40px 之间跳变，导致上方按钮整体上下移动。
+
+**修法**：
+- 布局改为固定 `layout_height="22dp"`，去掉 `visibility="gone"`，永远占位
+- 代码里所有 `setVisibility(VISIBLE/GONE)` 全部删掉，改为 `setText("...")` / `setText("")`
+- 实测 `tvAiStatus` 稳定占据 2487-2559，高度 72px 恒定
+
+### 4. GitHub 仓库
+- https://github.com/bookgeek99/Nchat （公开）
+- 本地 `/root/projects/nchat`，remote 为不含 token 的干净地址
+- 首次提交 `7b09f2f`
+- `.gitignore` 排除：build 产物、`android/app/src/main/assets/nchatd.jar`（由 buildall.sh 生成）、
+  `android/keystore/`（含签名密码）、`ht/` `st/` `httptest/`（临时调试目录）
+- 提交前用 `git diff --cached --name-only | grep -E '\.jks|\.keystore|build/|\.apk|\.jar'` 检查过，
+  确认无敏感文件；推送后又用 GitHub API 拉 trees 复查一遍
+
+**推送注意**：
+- 本机 `socks5://127.0.0.1:1080` 代理当前**未运行**，GitHub API 直连可用（HTTP 200）。
+  之前记忆里的代理配置这次不适用，先 `ss -ltnp | grep 1080` 确认再决定要不要走代理。
+- 创建仓库：`POST https://api.github.com/user/repos`，HTTP 201 即成功
+- 推送：`git push https://bookgeek99:TOKEN@github.com/bookgeek99/Nchat.git main`
+  （token 只用在命令行，绝不写进 remote）
+
 ## 构建命令
 ```bash
 ./buildall.sh
