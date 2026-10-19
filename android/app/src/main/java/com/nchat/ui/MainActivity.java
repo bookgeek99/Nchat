@@ -56,6 +56,21 @@ public class MainActivity extends AppCompatActivity {
     /** 是否已经成功展示过数据。启动流程里有几个异步 post 可能晚于 applyLoaded 执行，
      *  为 true 后忽略这些「迟到」的 showLoading，否则界面会永久停在加载中。 */
     private boolean readyOnce = false;
+
+    /**
+     * 本次运行期间已经被用户处理过的通知 key。
+     *
+     * 为什么需要它：`loadNotifications()` 每次回到前台都会重拉通知栏，
+     * 而「已处理」的通知不一定能立刻从通知栏消失（cancel 异步 / 目标 App 自己又挂回来）。
+     * 如果不记这个集合，点完「立即阅读」跳走再回来，那条通知会再次出现在卡片流里，
+     * 看起来像"没处理"。
+     *
+     * 只放内存、不落库：App 重启后重新以通知栏实时状态为准。
+     */
+    private final java.util.Set<String> handledThisSession = new java.util.HashSet<>();
+
+    /** 刚才是「点了打开 → 跳走 → 返回」这一趟，onResume 不应重建列表 */
+    private boolean justJumped = false;
     private Button btnSetup;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -254,6 +269,7 @@ public class MainActivity extends AppCompatActivity {
         if (pendingJump) {
             confirmJumpIfPending();
             advance();
+            justJumped = true;   // 标记这一趟是"跳转后返回"，onResume 不要重建列表
         }
     }
 
@@ -262,10 +278,15 @@ public class MainActivity extends AppCompatActivity {
         super.onResume();
         // 从设置页返回时可能配了 AI
         updateAiStatusHint();
-
-        // 每次回到前台都重新拉一次列表：
-        // 之前在别的 App 里收到的通知不会推给我们，靠 onCreate 那次读会漏掉最新的。
-        // readyOnce 用来跳过「首次 onCreate 的重复请求」（那时 ensureDaemonThenLoad 正在跑）。
+        // 如果是「点了打开 → 跳到别的 App → 又回来」这一趟，就**不要**重建列表。
+        // onPause 里已经 advance() 过了，重建会把 queue / doneCount / 当前页
+        // 全部重置，用户看到的又变回原来那条，像是"点了没反应"。
+        if (justJumped) {
+            justJumped = false;
+            return;
+        }
+        // 其余情况（从设置页 / 桌面 / 通知栏回来）：重拉一次。
+        // 别的 App 的新通知不会主动推给我们，靠 onCreate 那次读会漏。
         if (readyOnce) {
             loadNotifications(false);
         }
@@ -421,6 +442,7 @@ public class MainActivity extends AppCompatActivity {
                 if (it.isPersistent()) continue;
                 if (it.groupSummary) continue;  // 摘要条目一律不进决策流
                 if (pendingKeys.contains(it.key)) continue;  // 已挂待办，下面会单独恢复
+                if (handledThisSession.contains(it.key)) continue;  // 本次已处理过，别再弹出来
                 filtered.add(it);
             }
 
@@ -782,8 +804,15 @@ public class MainActivity extends AppCompatActivity {
         }
         io.execute(() -> {
             boolean ok = it.hasIntent && DaemonClient.click(it.key);
+            // 点「立即阅读」= 这条已经处理完毕，通知栏里也要一起清掉，
+            // 否则跳去目标 App 再回来，它还挂在那儿，显得没处理。
+            //
+            // 顺序必须是「先 click 再 cancel」：
+            // 有些 App 的 contentIntent 依赖通知本身存活，先 cancel 会让跳转失效。
+            DaemonClient.cancel(it.key);
+            final boolean clicked = ok;
             ui.post(() -> {
-                if (!ok) {
+                if (!clicked) {
                     toast("该通知没有可跳转的目标");
                     recordDecision(it, Decision.TYPE_DONE, false, true);
                     advance();
@@ -794,44 +823,60 @@ public class MainActivity extends AppCompatActivity {
                 // 跳转后不立刻 advance()：目标 App 需要时间切前台，
                 // 我们一重排就会把它压回去，看起来像"没反应"。
                 //
-                // 判断跳转是否成功，**不能**用 isSelfForeground() 轮询 ——
+                // 判断跳转是否成功**不能**用 isSelfForeground() 轮询 ——
                 // getRunningAppProcesses() 在 Android 7+ 对普通应用只返回自己的进程，
-                // 于是这个判断恒定"我还在前台"，大量正常通知被误报成
-                // 「可能是常驻/播放类」。
+                // 那个判断恒定"我还在前台"，会把所有通知都误报成「打不开」。
                 //
-                // 可靠做法：目标 App 起来时我们必然收到 onPause/onStop，
-                // 所以置一个 pendingJump 标记，由生命周期回调来确认成功；
-                // 只有超时后仍没收到 onPause 才判定为真的跳不出去。
+                // 改用三种路径推进，谁先到算谁：
+                //   1) onPause（正常跳转）—— 最可靠，目标 App 起来必然触发
+                //   2) 1.2s 宽限期内仍在前台 → 主动推进，不让用户干等
+                //   3) 6s 超时 → 提示"打不开"
                 pendingJump = true;
                 pendingJumpItem = it;
+                ui.postDelayed(jumpGraceRunnable, JUMP_GRACE_MS);
                 ui.postDelayed(jumpCheckRunnable, JUMP_TIMEOUT_MS);
             });
         });
     }
 
-    /** 等待 onPause 确认跳转成功的超时（冷启动 + WebView 首帧可能较慢） */
+    /** 宽限期：正常跳转几十到几百毫秒内就会 onPause，过了这么久还没走就别等了 */
+    private static final long JUMP_GRACE_MS = 1200;
+    /** 硬超时：到这一步说明确实打不开，给用户提示 */
     private static final long JUMP_TIMEOUT_MS = 6000;
+
     private boolean pendingJump = false;
     private NotifItem pendingJumpItem;
 
+    /** 宽限期到：没收到 onPause 也直接推进（秒跳秒回 / 内容页本身没法打开） */
+    private final Runnable jumpGraceRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!pendingJump) return;   // 已经被 onPause 收走了
+            if (isFinishing() || isDestroyed()) return;
+            confirmJumpIfPending();
+            justJumped = false;
+            advance();
+        }
+    };
+
+    /** 硬超时到：确实没跳出去，提示一句再推进，不让用户以为点了没反应 */
     private final Runnable jumpCheckRunnable = new Runnable() {
         @Override
         public void run() {
             if (!pendingJump) return;
-            pendingJump = false;
-            pendingJumpItem = null;
+            confirmJumpIfPending();
             if (isFinishing() || isDestroyed()) return;
-            // 到点仍没离开过本界面，说明 contentIntent 确实打不开
             toast("这条通知打不开（没有可跳转的页面）");
             advance();
         }
     };
 
-    /** 离开前台即视为跳转成功，清掉待定状态并推进卡片 */
+    /** 离开前台即视为跳转成功：清掉待定状态并推进卡片 */
     private void confirmJumpIfPending() {
         if (!pendingJump) return;
         pendingJump = false;
         pendingJumpItem = null;
+        ui.removeCallbacks(jumpGraceRunnable);
         ui.removeCallbacks(jumpCheckRunnable);
     }
 
@@ -1075,6 +1120,8 @@ public class MainActivity extends AppCompatActivity {
 
     /** 记录决策并入库 */
     private void recordDecision(NotifItem it, int type, boolean todoPending, boolean alreadyCanceled) {
+        // 登记到本次会话的已处理集合，避免 onResume 重拉列表时它又冒出来
+        if (it.key != null) handledThisSession.add(it.key);
         final Decision d = buildDecision(it, type, todoPending);
         final long rowId = it.decisionRowId;
         final String key = it.key;

@@ -632,6 +632,69 @@ UI 分四块：
 布局文件的插入一律用 `s.index('android:id="@+id/xxx"')` 定位、
 再 `rindex('<', ...)` 找标签起点来插，不要写整段匹配。
 
+
+## 第十一轮：点「立即阅读」后回到原卡片 / 通知栏不清除
+
+用户反馈：点了「立即阅读」，从目标 App 回来，还是停在原来那条卡片上；
+而且通知栏里那条也没被清掉。
+
+### 问题 1：回来后卡片又被"还原"了
+
+`onPause` 里确实 `advance()` 了，但紧跟着回到前台触发 `onResume`，
+而 `onResume` 里无条件 `loadNotifications(false)` ——
+这会**重建整个 queue**、把 `doneCount` 清零、`setCurrentItem(0)`，
+于是卡片又回到那条通知上，看起来像"点了没反应"。
+
+而且更糟：`loadNotifications` 里为了修「通知栏还有一堆、App 说全处理完了」，
+在第十轮之前把 `hasDecision` 过滤整个去掉了。结果**处理过的通知只要还在通知栏，
+下次加载就会重新出现**。
+
+两个修法：
+
+**(a) `justJumped` 标记**
+```java
+// onPause
+if (pendingJump) { confirmJumpIfPending(); advance(); justJumped = true; }
+
+// onResume
+if (justJumped) { justJumped = false; return; }  // 跳转返回，不重建列表
+```
+其余情况（从桌面 / 设置页 / 通知栏回来）仍然重拉，因为别的 App 的新通知不会推给我们。
+
+**(b) `handledThisSession` 会话级集合**
+```java
+private final Set<String> handledThisSession = new HashSet<>();
+// recordDecision 里登记；loadNotifications 过滤时跳过
+```
+只放内存不落库 —— App 重启后重新以通知栏实时状态为准，不会永久屏蔽。
+
+### 问题 2：点「立即阅读」不清通知栏
+
+`doReadNow()` 只调了 `DaemonClient.click()`，**没有 cancel**。
+其他所有操作（已完成/不感兴趣/已阅/稍后）都会 cancel，唯独这个漏了。
+
+```java
+boolean ok = it.hasIntent && DaemonClient.click(it.key);
+DaemonClient.cancel(it.key);   // ← 补上
+```
+
+**顺序必须是「先 click 再 cancel」**：有些 App 的 `contentIntent`
+依赖通知本身存活，先 cancel 会让跳转失效（实测 IT之家那条
+click → 跳进 NewsInfoV8Activity，cancel → `/state` 里从 1 变 0，全程正常）。
+
+### 顺带：推进卡片的时序理顺
+
+原来只有两条路径：`onPause`（成功）和 6 秒超时（失败）。
+如果目标 App 秒跳秒回、或 `contentIntent` 实际没起来，
+用户会盯着同一张卡片干等 6 秒。
+
+改成三条路径，谁先到算谁：
+1. `onPause` —— 正常跳转，最可靠
+2. **1.2s 宽限期**（`jumpGraceRunnable`）—— 还停在本界面就直接推进，不让用户干等
+3. 6s 硬超时（`jumpCheckRunnable`）—— 真的打不开才提示
+
+`confirmJumpIfPending()` 里统一 `removeCallbacks` 两个 runnable，避免重复推进。
+
 ## 构建命令
 ```bash
 ./buildall.sh
