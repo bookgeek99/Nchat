@@ -111,5 +111,17 @@
         android:textSize="10sp"
         android:textColor="@color/text_tertiary"
         android:text="" />
+    <TextView
+        android:id="@+id/tvTrace"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:textSize="10sp"
+        android:textColor="@color/text_tertiary"
+        android:textIsSelectable="true"
+        android:maxLines="3"
+        android:ellipsize="end"
+        android:visibility="gone"
+        android:text="" />
 
 </LinearLayout>

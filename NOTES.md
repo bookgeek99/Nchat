@@ -704,3 +704,152 @@ click → 跳进 NewsInfoV8Activity，cancel → `/state` 里从 1 变 0，全�
 安装：先 `cp /sdcard/Download/Nchat-1.0.apk /data/local/tmp/nchat.apk` 再 `pm install -r`
 （直接装 /sdcard 路径会报 fuse 权限错误）。
 签名：/root/projects/nchat/android/keystore/nchat.jks（storepass/keypass=nchat123，alias=nchat）
+
+---
+
+# 第十二轮：历史记录追加强 intent / 来源信息（DB v3）
+
+## 需求
+
+「给通知历史记录更多信息，比如 intent 信息，方便后续追踪通知进入 App 的触发方式。」
+
+原来的 `decisions` 表只存了 `pkg / channel_name / title / body` 这类展示字段，
+事后想回答「这条通知是怎么来的、点开的时候去了哪、跳成功没有」完全无据可查。
+`daemon` 侧也只输出 `hasIntent` 一个布尔值。
+
+## daemon 侧：itemJson() 扩充
+
+在 `hasIntent` 之后追加：
+
+```json
+"intent": {"pkg":"...","target":null,"action":null,"data":null,"flags":-1,"hasExtra":false,"mut":null},
+"fullScreenIntent": null,
+"actionIntents": [],
+"tag": null,
+"isOngoingFlag": false,
+"isFgsFlag": false,
+"isAutoCancel": true,
+"isGroupChild": false
+```
+
+新增两个辅助方法：`pendingIntentJson(PendingIntent)`、`pendingIntentIntent(PendingIntent)`。
+
+### 编译踩的两个坑
+
+1. `PendingIntent.FLAG_MUTABLE` 在 daemon 的编译目标（低 minSdk 的 javac+d8 直编）下
+   **不可见**，只能写字面量 `0x02000000`。
+2. `PendingIntent.getFlags()` 是 **@hide 方法**，直接调编译不过，
+   改成反射 `PendingIntent.class.getMethod("getFlags")`。
+
+### 只拿到了一半
+
+- `pi.getCreatorPackage()` **可用**，`intent.pkg` 能正确带出推送通道来源。
+- `target / action / data / mut` **全部为 null**：
+  反射读 `PendingIntent.mIntent` 被 **Android 12+ hidden API 拦截**，
+  即使用 root 进程跑 `app_process` 也不行。
+  试过 `mIntent / mTarget / mRecord / mPendingIntent` 四个候选字段名，全部失败。
+
+结论：**contentIntent 的具体目标在 Android 12+ 上从外部拿不到。**
+要追「跳转去了哪」，只能由 App 侧在真正点击时记录结果，而不是反查 intent。
+
+## 实测拿到的有价值数据（69 条通知）
+
+`intent.pkg` 分布：
+
+| 来源包 | 条数 | 含义 |
+|---|---|---|
+| `com.xiaomi.xmsf` | 45 | 小米推送通道转发 |
+| `com.android.mms` | 3 | 短信 |
+| `android` | 3 | 系统 |
+| `com.eg.android.AlipayGphone` | 2 | 支付宝 |
+| 其余各 1 | | 各 App 自身 |
+
+**45/69 走小米推送通道** —— 这解释了为什么大量第三方通知能到达本机，
+也说明「通知从哪来」和「通知属于哪个 App」是两件事，必须分开记。
+
+`tag` 非空 5 条，值为 `g:Aggregate_AlertingSection` 之类的系统聚合标记。
+
+## App 侧：DB v3
+
+`VERSION` 2 → 3，`decisions` 表新增 14 列：
+
+```
+intent_pkg TEXT            -- 来源包名（推送通道）
+intent_target TEXT         -- 目标组件（多数为 null）
+intent_action TEXT
+intent_data TEXT
+notif_tag TEXT
+notif_id INTEGER
+notif_flags INTEGER        -- 原始 flags，可反推 AUTO_CANCEL / ONGOING / FGS
+notif_category TEXT        -- msg / email / call / transport
+notif_channel TEXT         -- 渠道 id
+notif_group TEXT
+is_group_summary INTEGER
+post_time INTEGER          -- 通知发布时间
+jump_result INTEGER        -- -1 未尝试 / 0 失败 / 1 成功
+jump_cost_ms INTEGER       -- 跳转耗时
+```
+
+### 迁移写法
+
+`onUpgrade` 里 `if (oldV < 3)` 逐条 `ALTER TABLE ADD COLUMN`，
+每条独立 `try/catch` 吞掉异常 —— 重复列名时会抛，但不应中断整个升级。
+和已有 v2 的 `plan_at` 迁移风格保持一致。
+
+### 一个必须记住的坑
+
+**`CREATE TABLE` 拼接的 Java 字符串里绝对不能写 `//` 注释。**
+那会被原样拼进 SQL 文本，导致建表直接语法错误。
+注释只能写在语句外（Java 行注释），或用 SQL 的 `--`。
+
+## 跳转结果回写
+
+`jump_result / jump_cost_ms` 无法在决策落库的瞬间知道（跳转是异步确认的），
+所以拆成两步：
+
+1. `recordDecision()` 按 `NotifItem` 上当前的 `jumpResult` 落库
+2. `confirmJumpIfPending(boolean jumpOk)` 异步确认后再回写：
+   - `onPause` → `true`（成功）
+   - 1.2s 宽限期 → `false`
+   - 6s 硬超时 → `false`
+   新增 `NchatDb.updateJump(id, result, cost)` 与
+   `updateJumpByKey(key, result, cost)`（拿不到行 id 时的兜底，
+   作用于该 key 最新一条记录）。
+
+同时把结果写回 `NotifItem.jumpResult / jumpCostMs`，
+这样这条通知若之后再被记录，`buildDecision` 能把结果一起带进历史。
+
+## 历史页展示
+
+`item_history.xml` 新增 `tvTrace`（10sp、灰、可选中复制、最多 3 行）。
+`HistoryAdapter.buildTrace()` 拼一行精简文本：
+
+```
+来源 com.tencent.mm  id=-1661188118  flags=0x11  ch=message_channel_new_id
+来源 com.xiaomi.xmsf -> com.xxx.Activity  [跳转成功 320ms]
+```
+
+顺带补了 `TYPE_SEEN`（已阅）的 `status` 文案 —— 之前漏了，会显示成空白。
+
+## 验证记录
+
+- `PRAGMA user_version = 3`，`decisions` 共 26 列，14 个新列全部就位
+- 旧 131 条记录完好，未丢数据
+- 真机点击「已阅」产生的新记录
+  （`媳妇大聪明`，type=6）完整带上了
+  `intent_pkg=com.tencent.mm / notif_flags=17 / notif_channel=message_channel_new_id / notif_id=-1661188118 / post_time=1792471196726`
+- 历史页 UI 实际渲染出
+  `来源 com.tencent.mm  id=-1661188118  flags=0x11  ch=message_channel_new_id`
+- `logcat -b crash` 中 `com.nchat` 记录数 0
+
+### 过程中的环境问题
+
+- 设备上**没有 sqlite3 命令行**，所有库分析都走
+  `设备拷到 /sdcard/Download → Ubuntu 端 python3 sqlite3` 这条链。
+- `/data/local/tmp` 在 Ubuntu 容器里**不可见**，中转必须走 `/sdcard/Download`。
+- `pm install /sdcard/...` 会报 fuse 权限错误
+  （`system_server has no access to read file context u:o:fuse`），
+  必须先 `cp` 到 `/data/local/tmp` 再装。
+- 期间 NotificationShade 多次抢占焦点导致 UI 点击验证失败，
+  最后靠 `wm dismiss-keyguard` + 息屏/亮屏 + `input keyevent 82` 夺回焦点。
+

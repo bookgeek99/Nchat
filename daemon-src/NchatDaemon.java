@@ -452,6 +452,26 @@ public class NchatDaemon {
         sb.append("\"bigText\":\"").append(esc(cs(ex.getCharSequence(Notification.EXTRA_BIG_TEXT)))).append("\",");
         sb.append("\"subText\":\"").append(esc(cs(ex.getCharSequence(Notification.EXTRA_SUB_TEXT)))).append("\",");
         sb.append("\"hasIntent\":").append(n.contentIntent != null).append(',');
+        // ---- intent 追踪信息 ----
+        // 目的：事后能看出"这条通知是通过什么方式进来的 / 点了会去哪"，
+        // 用于排查跳转失败、判断是不是某种特定推送通道。
+        sb.append("\"intent\":").append(pendingIntentJson(n.contentIntent)).append(',');
+        sb.append("\"fullScreenIntent\":").append(pendingIntentJson(n.fullScreenIntent)).append(',');
+        sb.append("\"actionIntents\":["); 
+        if (n.actions != null) {
+            for (int i = 0; i < n.actions.length; i++) {
+                if (i > 0) sb.append(',');
+                sb.append(pendingIntentJson(n.actions[i].actionIntent));
+            }
+        }
+        sb.append("],");
+        // 通知 tag：key 里 tag 非 null 说明是按 tag 更新的（常见于进度/同会话消息合并）
+        sb.append("\"tag\":").append(sbn.getTag() == null ? "null" : "\"" + esc(sbn.getTag()) + "\"").append(',');
+        // 是否由系统重发（如渠道重要性变化时的重新通知）
+        sb.append("\"isOngoingFlag\":").append((n.flags & Notification.FLAG_ONGOING_EVENT) != 0).append(',');
+        sb.append("\"isFgsFlag\":").append((n.flags & Notification.FLAG_FOREGROUND_SERVICE) != 0).append(',');
+        sb.append("\"isAutoCancel\":").append((n.flags & Notification.FLAG_AUTO_CANCEL) != 0).append(',');
+        sb.append("\"isGroupChild\":").append(callBool(n, "isGroupChild")).append(',');
         // 分组信息：用于在 App 侧剔除「聚合摘要」通知（GroupSummary）
         String gk = callStr(sbn, "getGroup");
         sb.append("\"groupKey\":").append(gk == null ? "null" : "\"" + esc(gk) + "\"").append(',');
@@ -469,6 +489,95 @@ public class NchatDaemon {
         }
         sb.append("]}");
         return sb.toString();
+    }
+
+    /**
+     * 把 PendingIntent 拆成可读字段。
+     * 直接 toString() 拿不到有用信息，得通过 creatorPackage + 里面的 Intent 来分析。
+     *
+     * 输出：
+     *   pkg    --- creatorPackage（发出这个 PendingIntent 的应用）
+     *   target --- 目标组件（包名/类名），能看出会跳到哪个 Activity
+     *   action --- Intent.action
+     *   data   --- Intent.data 的 scheme://host/path
+     *   flags  --- Intent.flags
+     *   hasExtra --- 是否带 extras（推送通道常把跳转参数塞在这里）
+     *   mut  --- FLAG_MUTABLE
+     */
+    static String pendingIntentJson(PendingIntent pi) {
+        if (pi == null) return "null";
+        StringBuilder sb = new StringBuilder("{");
+
+        String creatorPkg = "";
+        try { creatorPkg = pi.getCreatorPackage(); } catch (Throwable ignore) {}
+        sb.append("\"pkg\":\"").append(esc(creatorPkg)).append("\",");
+
+        // 目标组件 / action / data：PendingIntent 没有公开 getter，只能反射。
+        // 不同 Android 版本字段名/嵌套层不同，做多候选探测；
+        // 拿不到就留空，不影响主流程。
+        String target = null, action = null, data = null;
+        int iflags = -1;
+        boolean hasExtra = false;
+        try {
+            Intent it = pendingIntentIntent(pi);
+            if (it != null) {
+                ComponentName cn = it.getComponent();
+                if (cn != null) target = cn.getPackageName() + "/" + cn.getClassName();
+                action = it.getAction();
+                android.net.Uri u = it.getData();
+                if (u != null) data = u.toString();
+                iflags = it.getFlags();
+                android.os.Bundle b = it.getExtras();
+                hasExtra = b != null && !b.isEmpty();
+                if (target == null && b != null) {
+                    // 有些推送把真正的落地页塞在 extra 里
+                    for (String k : new String[]{"target", "url", "jump_url", "link"}) {
+                        Object t = b.get(k);
+                        if (t instanceof String && !((String) t).isEmpty()) {
+                            target = k + "=" + t;
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignore) {}
+
+        sb.append("\"target\":").append(target == null ? "null" : "\"" + esc(target) + "\"").append(',');
+        sb.append("\"action\":").append(action == null ? "null" : "\"" + esc(action) + "\"").append(',');
+        sb.append("\"data\":").append(data == null ? "null" : "\"" + esc(data) + "\"").append(',');
+        sb.append("\"flags\":").append(iflags).append(',');
+        sb.append("\"hasExtra\":").append(hasExtra).append(',');
+
+        // PendingIntent.getFlags() 是 @hide，编译期 android.jar 不可见，只能反射。
+        // FLAG_MUTABLE = 0x02000000
+        String mut = null;
+        try {
+            java.lang.reflect.Method g = PendingIntent.class.getMethod("getFlags");
+            g.setAccessible(true);
+            int f = (Integer) g.invoke(pi);
+            mut = (f >= 0x02000000 && f < 0x04000000) ? "mutable" : "immutable";
+        } catch (Throwable ignore) {}
+        sb.append("\"mut\":").append(mut == null ? "null" : "\"" + mut + "\"");
+
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /**
+     * 尝试把 PendingIntent 里的 Intent 挖出来。
+     * 不同版本安卓字段名/嵌套层不同，逐个候选尝试。
+     */
+    static Intent pendingIntentIntent(PendingIntent pi) {
+        String[] names = {"mIntent", "mTarget", "mRecord", "mPendingIntent"};
+        for (String n : names) {
+            try {
+                java.lang.reflect.Field f = PendingIntent.class.getDeclaredField(n);
+                f.setAccessible(true);
+                Object v = f.get(pi);
+                if (v instanceof Intent) return (Intent) v;
+            } catch (Throwable ignore) {}
+        }
+        return null;
     }
 
     /** getGroup() / isGroupSummary() 都是 @hide，只能反射 */

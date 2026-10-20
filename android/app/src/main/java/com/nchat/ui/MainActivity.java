@@ -267,7 +267,7 @@ public class MainActivity extends AppCompatActivity {
         // 这里推进卡片（而不是在 doReadNow 里 advance），
         // 否则我们一重排就把刚起来的 App 压回去了。
         if (pendingJump) {
-            confirmJumpIfPending();
+            confirmJumpIfPending(true);   // 离开前台 = 确实跳出去了，记成功
             advance();
             justJumped = true;   // 标记这一趟是"跳转后返回"，onResume 不要重建列表
         }
@@ -833,6 +833,7 @@ public class MainActivity extends AppCompatActivity {
                 //   3) 6s 超时 → 提示"打不开"
                 pendingJump = true;
                 pendingJumpItem = it;
+                pendingJumpStart = System.currentTimeMillis();
                 ui.postDelayed(jumpGraceRunnable, JUMP_GRACE_MS);
                 ui.postDelayed(jumpCheckRunnable, JUMP_TIMEOUT_MS);
             });
@@ -846,6 +847,8 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean pendingJump = false;
     private NotifItem pendingJumpItem;
+    /** 跳转开始时刻，用于计算 jump_cost_ms */
+    private long pendingJumpStart = 0L;
 
     /** 宽限期到：没收到 onPause 也直接推进（秒跳秒回 / 内容页本身没法打开） */
     private final Runnable jumpGraceRunnable = new Runnable() {
@@ -853,7 +856,10 @@ public class MainActivity extends AppCompatActivity {
         public void run() {
             if (!pendingJump) return;   // 已经被 onPause 收走了
             if (isFinishing() || isDestroyed()) return;
-            confirmJumpIfPending();
+            // 宽限期内没离开前台：目标页可能已打开但仍是自绘窗口，
+            // 也可能压根没跳走。这里先按「未确认」记失败，
+            // 紧接着的 onPause（若真的跳了）会覆盖成成功。
+            confirmJumpIfPending(false);
             justJumped = false;
             advance();
         }
@@ -864,20 +870,49 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void run() {
             if (!pendingJump) return;
-            confirmJumpIfPending();
+            confirmJumpIfPending(false);   // 硬超时 = 确定跳不出去，记失败
             if (isFinishing() || isDestroyed()) return;
             toast("这条通知打不开（没有可跳转的页面）");
             advance();
         }
     };
 
-    /** 离开前台即视为跳转成功：清掉待定状态并推进卡片 */
-    private void confirmJumpIfPending() {
+    /**
+     * 收掉待定的跳转状态。
+     *
+     * @param jumpOk true = 已确认跳出去了（onPause），false = 超时/没跳走，null 亦可传 false
+     *
+     * 结果会回写到 decisions 表对应行的 jump_result / jump_cost_ms 两列，
+     * 这样以后翻历史就能看出「这条通知当时到底点不点得开、花了多久」，
+     * 而不是只看到一个 hasIntent 布尔值。
+     */
+    private void confirmJumpIfPending(boolean jumpOk) {
         if (!pendingJump) return;
         pendingJump = false;
+        final NotifItem it = pendingJumpItem;
         pendingJumpItem = null;
+        final long cost = pendingJumpStart > 0
+                ? System.currentTimeMillis() - pendingJumpStart : -1L;
+        pendingJumpStart = 0L;
         ui.removeCallbacks(jumpGraceRunnable);
         ui.removeCallbacks(jumpCheckRunnable);
+        if (it == null) return;
+        final int result = jumpOk ? Decision.JUMP_OK : Decision.JUMP_FAIL;
+        // 同时回写到 NotifItem 本身：这条通知后续若再被记录（如返回后再决策），
+        // buildDecision 能把跳转结果一起带进历史。
+        it.jumpResult = result;
+        it.jumpCostMs = cost;
+        final String key = it.key;
+        final long rowId = it.decisionRowId;
+        io.execute(() -> {
+            if (rowId > 0) db.updateJump(rowId, result, cost);
+            else db.updateJumpByKey(key, result, cost);
+        });
+    }
+
+    /** 兼容旧调用点：无参数视为失败（超时路径） */
+    private void confirmJumpIfPending() {
+        confirmJumpIfPending(false);
     }
 
     private void doDone(NotifItem it) {
@@ -1083,6 +1118,21 @@ public class MainActivity extends AppCompatActivity {
         d.channelName = it.channelName;
         d.category = it.aiCategory;
         d.todoPending = todoPending;
+        // ---- v3 来源追踪：把通知本身的元信息一起落到历史里 ----
+        d.intentPkg = it.intentPkg;
+        d.intentTarget = it.intentTarget;
+        d.intentAction = it.intentAction;
+        d.intentData = it.intentData;
+        d.notifTag = it.groupKey == null ? null : it.groupKey;
+        d.notifId = it.id;
+        d.notifFlags = it.flags;
+        d.notifCategory = it.category;
+        d.notifChannel = it.channel;
+        d.notifGroup = it.groupKey;
+        d.isGroupSummary = it.groupSummary;
+        d.postTime = it.postTime;
+        d.jumpResult = it.jumpResult;
+        d.jumpCostMs = it.jumpCostMs;
         return d;
     }
 

@@ -18,7 +18,7 @@ import java.util.List;
 public class NchatDb extends SQLiteOpenHelper {
 
     private static final String NAME = "nchat.db";
-    private static final int VERSION = 2;
+    private static final int VERSION = 3;
 
     private static NchatDb instance;
 
@@ -45,7 +45,22 @@ public class NchatDb extends SQLiteOpenHelper {
                 + "channel_name TEXT,"
                 + "category INTEGER,"
                 + "todo_pending INTEGER DEFAULT 0,"
-                + "plan_at INTEGER DEFAULT 0"
+                + "plan_at INTEGER DEFAULT 0,"
+                // v3 追踪字段：记录通知来源与跳转结果
+                + "intent_pkg TEXT,"
+                + "intent_target TEXT,"
+                + "intent_action TEXT,"
+                + "intent_data TEXT,"
+                + "notif_tag TEXT,"
+                + "notif_id INTEGER DEFAULT 0,"
+                + "notif_flags INTEGER DEFAULT 0,"
+                + "notif_category TEXT,"
+                + "notif_channel TEXT,"
+                + "notif_group TEXT,"
+                + "is_group_summary INTEGER DEFAULT 0,"
+                + "post_time INTEGER DEFAULT 0,"
+                + "jump_result INTEGER DEFAULT -1,"
+                + "jump_cost_ms INTEGER DEFAULT -1"
                 + ")");
         db.execSQL("CREATE INDEX idx_decided_at ON decisions(decided_at DESC)");
         db.execSQL("CREATE INDEX idx_notif_key ON decisions(notif_key)");
@@ -75,6 +90,30 @@ public class NchatDb extends SQLiteOpenHelper {
                 db.execSQL("ALTER TABLE decisions ADD COLUMN plan_at INTEGER DEFAULT 0");
             } catch (Throwable ignore) {}
         }
+        if (oldV < 3) {
+            // v3：通知来源追踪字段。逐条 ALTER，重复列名抛异常直接忽略。
+            String[] alters = new String[]{
+                    "ALTER TABLE decisions ADD COLUMN intent_pkg TEXT",
+                    "ALTER TABLE decisions ADD COLUMN intent_target TEXT",
+                    "ALTER TABLE decisions ADD COLUMN intent_action TEXT",
+                    "ALTER TABLE decisions ADD COLUMN intent_data TEXT",
+                    "ALTER TABLE decisions ADD COLUMN notif_tag TEXT",
+                    "ALTER TABLE decisions ADD COLUMN notif_id INTEGER DEFAULT 0",
+                    "ALTER TABLE decisions ADD COLUMN notif_flags INTEGER DEFAULT 0",
+                    "ALTER TABLE decisions ADD COLUMN notif_category TEXT",
+                    "ALTER TABLE decisions ADD COLUMN notif_channel TEXT",
+                    "ALTER TABLE decisions ADD COLUMN notif_group TEXT",
+                    "ALTER TABLE decisions ADD COLUMN is_group_summary INTEGER DEFAULT 0",
+                    "ALTER TABLE decisions ADD COLUMN post_time INTEGER DEFAULT 0",
+                    "ALTER TABLE decisions ADD COLUMN jump_result INTEGER DEFAULT -1",
+                    "ALTER TABLE decisions ADD COLUMN jump_cost_ms INTEGER DEFAULT -1"
+            };
+            for (String sql : alters) {
+                try {
+                    db.execSQL(sql);
+                } catch (Throwable ignore) {}
+            }
+        }
     }
 
     // ==================== 决策 ====================
@@ -92,9 +131,57 @@ public class NchatDb extends SQLiteOpenHelper {
         cv.put("category", d.category == null ? -1 : d.category.ordinal());
         cv.put("todo_pending", d.todoPending ? 1 : 0);
         cv.put("plan_at", d.planAt);
+        putTrace(cv, d);
         long id = getWritableDatabase().insert("decisions", null, cv);
         d.id = id;
         return id;
+    }
+
+    /** v3 追踪字段统一写入，insert / upsert / update 三处共用 */
+    private static void putTrace(ContentValues cv, Decision d) {
+        cv.put("intent_pkg", d.intentPkg);
+        cv.put("intent_target", d.intentTarget);
+        cv.put("intent_action", d.intentAction);
+        cv.put("intent_data", d.intentData);
+        cv.put("notif_tag", d.notifTag);
+        cv.put("notif_id", d.notifId);
+        cv.put("notif_flags", d.notifFlags);
+        cv.put("notif_category", d.notifCategory);
+        cv.put("notif_channel", d.notifChannel);
+        cv.put("notif_group", d.notifGroup);
+        cv.put("is_group_summary", d.isGroupSummary ? 1 : 0);
+        cv.put("post_time", d.postTime);
+        cv.put("jump_result", d.jumpResult);
+        cv.put("jump_cost_ms", d.jumpCostMs);
+    }
+
+    /**
+     * 单独回写跳转结果。
+     * 跳转是异步确认的（onPause / 宽限期 / 超时三条路径），
+     * 决策行往往先落库，之后才知道成功与否，所以需要一个只改这两列的入口。
+     */
+    public void updateJump(long id, int result, long costMs) {
+        if (id <= 0) return;
+        ContentValues cv = new ContentValues();
+        cv.put("jump_result", result);
+        cv.put("jump_cost_ms", costMs);
+        try {
+            getWritableDatabase().update("decisions", cv,
+                    "id=?", new String[]{String.valueOf(id)});
+        } catch (Throwable ignore) {}
+    }
+
+    /** 按通知 key 回写跳转结果（拿不到行 id 时的兜底，作用于最新一条同 key 记录） */
+    public void updateJumpByKey(String notifKey, int result, long costMs) {
+        if (notifKey == null) return;
+        ContentValues cv = new ContentValues();
+        cv.put("jump_result", result);
+        cv.put("jump_cost_ms", costMs);
+        try {
+            getWritableDatabase().update("decisions", cv,
+                    "notif_key=? AND id=(SELECT MAX(id) FROM decisions WHERE notif_key=?)",
+                    new String[]{notifKey, notifKey});
+        } catch (Throwable ignore) {}
     }
 
     public boolean hasDecision(String notifKey) {
@@ -196,6 +283,7 @@ public class NchatDb extends SQLiteOpenHelper {
         cv.put("pkg", d.pkg);
         cv.put("uid_channel", d.uidChannel);
         cv.put("notif_key", d.notifKey);
+        putTrace(cv, d);
 
         // 关键：同一条通知只允许存在一条待办记录。
         // 无论历史上有多少条同 key 的行（旧版本 bug 造成的），这里先全删再插一条，
@@ -298,7 +386,32 @@ public class NchatDb extends SQLiteOpenHelper {
         d.todoPending = c.getInt(c.getColumnIndexOrThrow("todo_pending")) == 1;
         int pIdx = c.getColumnIndex("plan_at");
         d.planAt = pIdx >= 0 ? c.getLong(pIdx) : 0;
+        // v3 追踪字段（旧库刚升级时可能全为 null，按列存在性安全读取）
+        d.intentPkg = getStr(c, "intent_pkg");
+        d.intentTarget = getStr(c, "intent_target");
+        d.intentAction = getStr(c, "intent_action");
+        d.intentData = getStr(c, "intent_data");
+        d.notifTag = getStr(c, "notif_tag");
+        d.notifId = (int) getLong(c, "notif_id", 0);
+        d.notifFlags = (int) getLong(c, "notif_flags", 0);
+        d.notifCategory = getStr(c, "notif_category");
+        d.notifChannel = getStr(c, "notif_channel");
+        d.notifGroup = getStr(c, "notif_group");
+        d.isGroupSummary = getLong(c, "is_group_summary", 0) == 1;
+        d.postTime = getLong(c, "post_time", 0);
+        d.jumpResult = (int) getLong(c, "jump_result", Decision.JUMP_NONE);
+        d.jumpCostMs = getLong(c, "jump_cost_ms", -1);
         return d;
+    }
+
+    private static String getStr(Cursor c, String col) {
+        int i = c.getColumnIndex(col);
+        return i >= 0 && !c.isNull(i) ? c.getString(i) : null;
+    }
+
+    private static long getLong(Cursor c, String col, long def) {
+        int i = c.getColumnIndex(col);
+        return i >= 0 && !c.isNull(i) ? c.getLong(i) : def;
     }
 
     // ==================== 统计（为将来的智能判断积累样本） ====================

@@ -26,6 +26,21 @@ public class NotifItem {
     public String bigText;
     public String subText;
     public boolean hasIntent;
+    // ---- v3 来源追踪：contentIntent 的创建者与目标 ----
+    /** 触发本通知的 PendingIntent 创建者包名（推送通道来源） */
+    public String intentPkg;
+    /** 目标组件 / action / data（Android 12+ 多为 null） */
+    public String intentTarget;
+    public String intentAction;
+    public String intentData;
+    /** contentIntent 的 flag 原始值（0 表示未知） */
+    public int intentFlags;
+
+    // ---- 运行时附加：这张卡片的跳转结果（不入 /state，由 App 侧回写） ----
+    /** -1 未尝试 / 0 失败 / 1 成功 */
+    public int jumpResult = Decision.JUMP_NONE;
+    /** 跳转耗时（毫秒）；-1 表示未尝试 */
+    public long jumpCostMs = -1;
     public List<String> actions = new ArrayList<>();
     public String groupKey;           // 分组 key（null 表示未分组）
     public boolean groupSummary;      // true = 该 App 多条通知的「聚合摘要」条目
@@ -59,6 +74,14 @@ public class NotifItem {
         it.bigText = o.optString("bigText");
         it.subText = o.optString("subText");
         it.hasIntent = o.optBoolean("hasIntent");
+        JSONObject pi = o.optJSONObject("intent");
+        if (pi != null) {
+            it.intentPkg = pi.isNull("pkg") ? null : pi.optString("pkg");
+            it.intentTarget = pi.isNull("target") ? null : pi.optString("target");
+            it.intentAction = pi.isNull("action") ? null : pi.optString("action");
+            it.intentData = pi.isNull("data") ? null : pi.optString("data");
+            it.intentFlags = pi.optInt("flags", 0);
+        }
         it.groupKey = o.isNull("groupKey") ? null : o.optString("groupKey");
         it.groupSummary = o.optBoolean("isGroupSummary", false);
         it.channelImportance = o.optInt("channelImportance", -1);
@@ -160,6 +183,10 @@ public class NotifItem {
         it.fromTodo = true;
         it.decisionRowId = d.id;
         it.planAt = d.planAt;
+        it.intentPkg = d.intentPkg;
+        it.intentTarget = d.intentTarget;
+        it.intentAction = d.intentAction;
+        it.intentData = d.intentData;
         return it;
     }
 
