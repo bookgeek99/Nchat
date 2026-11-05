@@ -29,11 +29,21 @@ public class CardAdapter extends RecyclerView.Adapter<CardAdapter.VH> {
         void onActionClick(NotifItem item, int actionIndex);
     }
 
+    /** 点卡片本体 = 点「立即阅读 / 立即办理」，行为完全一致 */
+    public interface OnCardClickListener {
+        void onCardClick(NotifItem item);
+    }
+
     private final List<NotifItem> items = new ArrayList<>();
     private OnNotifActionClick actionListener;
+    private OnCardClickListener cardListener;
 
     public void setOnNotifActionClick(OnNotifActionClick l) {
         this.actionListener = l;
+    }
+
+    public void setOnCardClickListener(OnCardClickListener l) {
+        this.cardListener = l;
     }
 
     public void submit(List<NotifItem> list) {
@@ -78,7 +88,27 @@ public class CardAdapter extends RecyclerView.Adapter<CardAdapter.VH> {
         setBarColor(h.vCatBar, cat.color);
 
         String chName = it.channelName == null ? "" : it.channelName;
-        h.tvChannel.setText(chName);
+
+        // 聚合卡片：渠道行后面标出「N 条相似」，正文换成组内摘要
+        if (it.isGrouped()) {
+            h.tvChannel.setText((chName.isEmpty() ? "" : chName + " · ")
+                    + it.groupSize + " 条相似");
+            String preview = com.nchat.util.NotifGrouper.memberPreview(it);
+            if (!preview.isEmpty()) {
+                h.tvBody.setText(preview);
+                h.tvBody.setVisibility(View.VISIBLE);
+            }
+        } else {
+            h.tvChannel.setText(chName);
+        }
+
+        // 整张卡片可点 = 立即阅读 / 立即办理。
+        // 用 setOnClickListener 而不是 OnTouchListener，
+        // 这样 ViewPager2 的左右滑动、ScrollView 的滚动都不受影响。
+        h.itemView.setClickable(true);
+        h.itemView.setOnClickListener(v -> {
+            if (cardListener != null) cardListener.onCardClick(it);
+        });
 
         // 原通知的快捷 action
         h.llNotifActions.removeAllViews();

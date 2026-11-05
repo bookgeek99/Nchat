@@ -18,7 +18,7 @@ import java.util.List;
 public class NchatDb extends SQLiteOpenHelper {
 
     private static final String NAME = "nchat.db";
-    private static final int VERSION = 3;
+    private static final int VERSION = 4;
 
     private static NchatDb instance;
 
@@ -60,7 +60,10 @@ public class NchatDb extends SQLiteOpenHelper {
                 + "is_group_summary INTEGER DEFAULT 0,"
                 + "post_time INTEGER DEFAULT 0,"
                 + "jump_result INTEGER DEFAULT -1,"
-                + "jump_cost_ms INTEGER DEFAULT -1"
+                + "jump_cost_ms INTEGER DEFAULT -1,"
+                // v4：跳转失败原因（排查「点了没反应」用）
+                + "jump_reason TEXT,"
+                + "jump_top TEXT"
                 + ")");
         db.execSQL("CREATE INDEX idx_decided_at ON decisions(decided_at DESC)");
         db.execSQL("CREATE INDEX idx_notif_key ON decisions(notif_key)");
@@ -114,6 +117,18 @@ public class NchatDb extends SQLiteOpenHelper {
                 } catch (Throwable ignore) {}
             }
         }
+        if (oldV < 4) {
+            // v4：jump reason / top，用来诊断「点了立即阅读打不开」
+            String[] alters = new String[]{
+                    "ALTER TABLE decisions ADD COLUMN jump_reason TEXT",
+                    "ALTER TABLE decisions ADD COLUMN jump_top TEXT"
+            };
+            for (String sql : alters) {
+                try {
+                    db.execSQL(sql);
+                } catch (Throwable ignore) {}
+            }
+        }
     }
 
     // ==================== 决策 ====================
@@ -153,6 +168,8 @@ public class NchatDb extends SQLiteOpenHelper {
         cv.put("post_time", d.postTime);
         cv.put("jump_result", d.jumpResult);
         cv.put("jump_cost_ms", d.jumpCostMs);
+        cv.put("jump_reason", d.jumpReason);
+        cv.put("jump_top", d.jumpTop);
     }
 
     /**
@@ -161,10 +178,17 @@ public class NchatDb extends SQLiteOpenHelper {
      * 决策行往往先落库，之后才知道成功与否，所以需要一个只改这两列的入口。
      */
     public void updateJump(long id, int result, long costMs) {
+        updateJump(id, result, costMs, null, null);
+    }
+
+    /** 带失败原因与前台 Activity 的版本（排查跳转问题用） */
+    public void updateJump(long id, int result, long costMs, String reason, String top) {
         if (id <= 0) return;
         ContentValues cv = new ContentValues();
         cv.put("jump_result", result);
         cv.put("jump_cost_ms", costMs);
+        cv.put("jump_reason", reason);
+        cv.put("jump_top", top);
         try {
             getWritableDatabase().update("decisions", cv,
                     "id=?", new String[]{String.valueOf(id)});
@@ -173,10 +197,16 @@ public class NchatDb extends SQLiteOpenHelper {
 
     /** 按通知 key 回写跳转结果（拿不到行 id 时的兜底，作用于最新一条同 key 记录） */
     public void updateJumpByKey(String notifKey, int result, long costMs) {
+        updateJumpByKey(notifKey, result, costMs, null, null);
+    }
+
+    public void updateJumpByKey(String notifKey, int result, long costMs, String reason, String top) {
         if (notifKey == null) return;
         ContentValues cv = new ContentValues();
         cv.put("jump_result", result);
         cv.put("jump_cost_ms", costMs);
+        cv.put("jump_reason", reason);
+        cv.put("jump_top", top);
         try {
             getWritableDatabase().update("decisions", cv,
                     "notif_key=? AND id=(SELECT MAX(id) FROM decisions WHERE notif_key=?)",
@@ -401,6 +431,8 @@ public class NchatDb extends SQLiteOpenHelper {
         d.postTime = getLong(c, "post_time", 0);
         d.jumpResult = (int) getLong(c, "jump_result", Decision.JUMP_NONE);
         d.jumpCostMs = getLong(c, "jump_cost_ms", -1);
+        d.jumpReason = getStr(c, "jump_reason");
+        d.jumpTop = getStr(c, "jump_top");
         return d;
     }
 

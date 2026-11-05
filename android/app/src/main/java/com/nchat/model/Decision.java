@@ -69,6 +69,18 @@ public class Decision {
     public int jumpResult = JUMP_NONE;
     /** 跳转耗时（毫秒）；-1 表示未尝试 */
     public long jumpCostMs = -1;
+    /**
+     * 跳转失败原因。这是排查「点了没反应」的核心字段。
+     *   bal_block     —— 被 Android 15 后台启动限制静默拦截
+     *   no_change     —— intent 发了但前台没变，目标页可能不存在
+     *   already_front —— 目标 App 本来就在前台
+     *   notification_not_found —— 通知已经消失
+     *   send_failed   —— PendingIntent 发送异常
+     * null 表示成功或未尝试。
+     */
+    public String jumpReason;
+    /** 跳转后（或未跳转时的）前台 Activity，用于对账 */
+    public String jumpTop;
 
     /** 用于 UI 展示的一行来源摘要 */
     public String sourceSummary() {

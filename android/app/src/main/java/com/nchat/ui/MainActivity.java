@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.util.Log;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
@@ -147,6 +148,10 @@ public class MainActivity extends AppCompatActivity {
                 updateProgress();
             }
         });
+        // 点卡片本体 = 立即阅读/立即办理。
+        // 聚合卡片点进去只会跳一条（代表卡片那条），
+        // 想要逐条挑可以去通知栏，或者先展开 —— 这里保持简单。
+        adapter.setOnCardClickListener(this::doReadNow);
         adapter.setOnNotifActionClick((item, idx) -> {
             io.execute(() -> {
                 boolean ok = DaemonClient.triggerAction(item.key, idx);
@@ -476,7 +481,12 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
-            ui.post(() -> applyLoaded(filtered, st.error, showToast));
+            // 相似通知聚合：同一 App 同渠道同标题的反复推送合并成一张卡片，
+            // 一次「已阅」就把整组清掉，不用逐条点。
+            // 注意放在分类之后、applyLoaded 之前 —— 组代表卡片要带上正确的分类。
+            List<NotifItem> grouped = com.nchat.util.NotifGrouper.group(filtered);
+
+            ui.post(() -> applyLoaded(grouped, st.error, showToast));
 
             if (!needAi.isEmpty()) {
                 ui.post(() -> {
@@ -642,6 +652,8 @@ public class MainActivity extends AppCompatActivity {
             case INFO:      openLabel = "立即阅读"; break;
             default:        openLabel = "打开通知"; break;
         }
+        // 聚合卡片：主按钮只跳一条，标清楚避免误解
+        if (it.isGrouped()) openLabel = "打开其中一条";
 
         if (canOpen) {
             addPrimary(openLabel, 0xFF1F6F6F, () -> doReadNow(it));
@@ -660,7 +672,9 @@ public class MainActivity extends AppCompatActivity {
                 ? Decision.TYPE_READ_LATER : Decision.TYPE_DO_LATER));
 
         // 第三行：已阅 + 不感兴趣，两个按钮并排一行
-        addSecondaryRow(new String[]{"已阅", "不感兴趣"},
+        // 聚合卡片上「已阅」= 整组一次清完，按钮文案标明条数
+        String seenLabel = it.isGrouped() ? ("已阅 " + it.groupSize + " 条") : "已阅";
+        addSecondaryRow(new String[]{seenLabel, "不感兴趣"},
                 new int[]{0xFF23324A, 0xFF3A1F24},
                 new int[]{0xFFB0C4DE, 0xFFFF7A8A},
                 new Runnable[]{() -> doSeen(it), () -> doIgnore(it)});
@@ -803,17 +817,40 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         io.execute(() -> {
-            boolean ok = it.hasIntent && DaemonClient.click(it.key);
+            final DaemonClient.ClickResult res = it.hasIntent
+                    ? DaemonClient.clickDetailed(it.key)
+                    : new DaemonClient.ClickResult();
+
+            // ---- 关键：daemon 已经等到前台窗口变化（或 2.5s 超时）才返回，
+            //      所以这里拿到的是**真实结果**，不再是「send 成功就算成功」。 ----
+            final boolean jumped = res.jumped;
+            it.jumpResult = jumped ? Decision.JUMP_OK : Decision.JUMP_FAIL;
+            it.jumpCostMs = res.costMs;
+            it.jumpReason = jumped ? null : (res.reason == null ? "send_failed" : res.reason);
+            it.jumpTop = res.top;
+            Log.i(TAG_JUMP, "click key=" + it.key
+                    + " pkg=" + it.pkg
+                    + " hasIntent=" + it.hasIntent
+                    + " jump=" + jumped
+                    + " reason=" + it.jumpReason
+                    + " cost=" + res.costMs + "ms"
+                    + " top=" + res.top
+                    + " hint=" + res.hint);
+
             // 点「立即阅读」= 这条已经处理完毕，通知栏里也要一起清掉，
             // 否则跳去目标 App 再回来，它还挂在那儿，显得没处理。
             //
             // 顺序必须是「先 click 再 cancel」：
             // 有些 App 的 contentIntent 依赖通知本身存活，先 cancel 会让跳转失效。
-            DaemonClient.cancel(it.key);
-            final boolean clicked = ok;
+            cancelGroup(it);
+
             ui.post(() -> {
-                if (!clicked) {
-                    toast("该通知没有可跳转的目标");
+                if (!jumped) {
+                    // 跳转失败要说清原因，不能让用户对着屏幕猜。
+                    // 同时明确告诉他通知已经清掉了，避免他再去通知栏找。
+                    String why = res.hint != null && !res.hint.isEmpty()
+                            ? res.hint : res.reasonLabel();
+                    toast("打不开这条通知：" + why + "（已从通知栏清除）");
                     recordDecision(it, Decision.TYPE_DONE, false, true);
                     advance();
                     return;
@@ -840,6 +877,8 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    /** 跳转诊断专用 TAG，`adb logcat -s NchatJump` 即可只看点击结果 */
+    private static final String TAG_JUMP = "NchatJump";
     /** 宽限期：正常跳转几十到几百毫秒内就会 onPause，过了这么久还没走就别等了 */
     private static final long JUMP_GRACE_MS = 1200;
     /** 硬超时：到这一步说明确实打不开，给用户提示 */
@@ -923,7 +962,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         io.execute(() -> {
-            DaemonClient.cancel(it.key);
+            cancelGroup(it);
             ui.post(() -> {
                 recordDecision(it, Decision.TYPE_DONE, false, false);
                 advance();
@@ -945,7 +984,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         io.execute(() -> {
-            DaemonClient.cancel(it.key);
+            cancelGroup(it);
             ui.post(() -> {
                 recordDecision(it, Decision.TYPE_SEEN, false, false);
                 advance();
@@ -961,7 +1000,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         io.execute(() -> {
-            DaemonClient.cancel(it.key);
+            cancelGroup(it);
             ui.post(() -> {
                 recordDecision(it, Decision.TYPE_IGNORE, false, false);
                 advance();
@@ -1005,7 +1044,7 @@ public class MainActivity extends AppCompatActivity {
             final long planAt = planTimeOf(label);
             io.execute(() -> {
                 // 原通知还在通知栏的话清掉它
-                if (!it.fromTodo) DaemonClient.cancel(it.key);
+                if (!it.fromTodo) cancelGroup(it);
                 Decision d = buildDecision(it, type, true);
                 d.planAt = planAt;
                 db.upsertTodo(d);
@@ -1170,6 +1209,18 @@ public class MainActivity extends AppCompatActivity {
 
     /** 记录决策并入库 */
     private void recordDecision(NotifItem it, int type, boolean todoPending, boolean alreadyCanceled) {
+        // 聚合卡片：整组一起登记、一起记录。
+        // 否则组内其它成员没进 handledThisSession，下次刷新还会冒出来，
+        // 用户会觉得「已阅了怎么还有」。
+        if (it.isGrouped()) {
+            for (NotifItem m : it.allMembers()) recordOneDecision(m, type, todoPending);
+            return;
+        }
+        recordOneDecision(it, type, todoPending);
+    }
+
+    /** 单条记录（聚合卡片会逐条调用） */
+    private void recordOneDecision(NotifItem it, int type, boolean todoPending) {
         // 登记到本次会话的已处理集合，避免 onResume 重拉列表时它又冒出来
         if (it.key != null) handledThisSession.add(it.key);
         final Decision d = buildDecision(it, type, todoPending);
@@ -1188,6 +1239,13 @@ public class MainActivity extends AppCompatActivity {
                 db.insertDecision(d);
             }
         });
+    }
+
+    /** 批量 cancel 一个聚合组里所有还活着的通知 */
+    private void cancelGroup(NotifItem it) {
+        for (String k : it.allKeys()) {
+            DaemonClient.cancel(k);
+        }
     }
 
     /** 从队列中移除当前项并前进 */

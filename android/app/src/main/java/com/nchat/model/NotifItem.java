@@ -41,6 +41,81 @@ public class NotifItem {
     public int jumpResult = Decision.JUMP_NONE;
     /** 跳转耗时（毫秒）；-1 表示未尝试 */
     public long jumpCostMs = -1;
+    /** 跳转失败原因（bal_block / no_change / ...），null 表示成功或未尝试 */
+    public String jumpReason;
+    /** 跳转后的前台 Activity */
+    public String jumpTop;
+
+    // ==================== 相似通知聚合 ====================
+    /**
+     * 同一 App 反复发来的相似通知会被合并成一组，只留第一条当代表卡片，
+     * 其余挂在这里。空列表 = 没有相似兄弟，普通单条。
+     */
+    public List<NotifItem> groupMembers = new ArrayList<>();
+
+    /** 组内总条数（含代表自己）。1 表示没聚合。 */
+    public int groupSize = 1;
+
+    public boolean isGrouped() {
+        return groupSize > 1;
+    }
+
+    /** 所有成员（含自己）的通知 key —— 批量 cancel / 批量记录用 */
+    public List<String> allKeys() {
+        List<String> ks = new ArrayList<>();
+        if (key != null) ks.add(key);
+        for (NotifItem m : groupMembers) {
+            if (m != null && m.key != null) ks.add(m.key);
+        }
+        return ks;
+    }
+
+    /** 所有成员（含自己），方便遍历 */
+    public List<NotifItem> allMembers() {
+        List<NotifItem> all = new ArrayList<>();
+        all.add(this);
+        all.addAll(groupMembers);
+        return all;
+    }
+
+    /**
+     * 两条通知是否「相似」—— 聚合判定。
+     *
+     * 判定维度刻意保守：宁可少聚合，也不要错误地把不同事情合并，
+     * 因为一旦合并，用户点「已阅」会一次性清掉整组，误合并 = 误删。
+     *
+     * 必须同时满足：
+     *   1) 同一个 App（pkg 相同）
+     *   2) 同一个渠道（channel 相同；渠道不同说明是不同类型的推送）
+     *   3) 标题高度相似（归一化后相同，或一个是另一个的前缀）
+     * 正文不参与判定 —— 同标题的不同正文（如「新消息：任务A」/「新消息：任务B」）
+     * 恰恰就是要聚合的典型场景。
+     */
+    public boolean isSimilarTo(NotifItem o) {
+        if (o == null) return false;
+        if (pkg == null || !pkg.equals(o.pkg)) return false;
+        if (channel == null ? o.channel != null : !channel.equals(o.channel)) return false;
+        String a = normTitle(displayTitle());
+        String b = normTitle(o.displayTitle());
+        if (a.isEmpty() || b.isEmpty()) return false;
+        if (a.equals(b)) return true;
+        // 前缀关系：如「新消息：任务已完成」vs「新消息：审批通过」
+        // 取较短者做前缀匹配，且长度要够（避免「新」这种单字误配）
+        String shorter = a.length() <= b.length() ? a : b;
+        String longer = a.length() <= b.length() ? b : a;
+        return shorter.length() >= 2 && longer.startsWith(shorter);
+    }
+
+    /** 标题归一化：去掉空白、标点、数字差异带来的干扰 */
+    private static String normTitle(String t) {
+        if (t == null) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (Character.isLetterOrDigit(c)) sb.append(Character.toLowerCase(c));
+        }
+        return sb.toString();
+    }
     public List<String> actions = new ArrayList<>();
     public String groupKey;           // 分组 key（null 表示未分组）
     public boolean groupSummary;      // true = 该 App 多条通知的「聚合摘要」条目
