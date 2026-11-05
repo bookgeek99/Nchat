@@ -420,7 +420,7 @@ public class MainActivity extends AppCompatActivity {
     // ==================== 加载 ====================
 
     private void loadNotifications(boolean showToast) {
-        io.execute(() -> {
+        boolean submitted = submitIo(() -> {  // 池已关闭时不抛异常（见 submitIo）
             DaemonClient.State st = DaemonClient.fetchState();
             List<NotifItem> raw = st.items;
 
@@ -519,6 +519,17 @@ public class MainActivity extends AppCompatActivity {
                 });
             }
         });
+        if (!submitted) return;   // Activity 已销毁，任务被丢弃
+    }
+
+    /** 安全提交到 io 线程池；池已关闭时返回 false 而不是抛异常 */
+    private boolean submitIo(Runnable r) {
+        try {
+            io.execute(r);
+            return true;
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            return false;
+        }
     }
 
     private void applyLoaded(List<NotifItem> list, String error, boolean showToast) {
@@ -589,10 +600,39 @@ public class MainActivity extends AppCompatActivity {
             tvEmptyTitle.setText("读取失败");
             tvEmptyHint.setText(error);
         } else {
+            // 全部处理完 = 给点正反馈。
+            // 「今天多少条」「累计多少条」比单纯一句"干完了"更有成就感，
+            // 也是让人愿意持续用下去的钩子。
             tvEmptyTitle.setText("全部处理完了");
-            long today = db.countSince(com.nchat.util.TimeUtil.startOfDay(System.currentTimeMillis()));
-            tvEmptyHint.setText(today > 0 ? "今天已处理 " + today + " 条" : "通知栏很干净");
+            io.execute(() -> {
+                final int today = db.countToday();
+                final int total = db.countTotal();
+                ui.post(() -> tvEmptyHint.setText(formatDoneSummary(today, total)));
+            });
         }
+    }
+
+    /** 完成页的一句话总结 */
+    private static String formatDoneSummary(int today, int total) {
+        if (today <= 0 && total <= 0) return "通知栏很干净";
+        if (today <= 0) return "累计已处理 " + total + " 条";
+        if (today == total) return "今天已处理 " + today + " 条";
+        return "今天已处理 " + today + " 条 · 累计 " + total + " 条";
+    }
+
+    /**
+     * 一批处理完时给个完成反馈。
+     * 只在「从有到无」的那一次触发，避免每次刷新都响。
+     */
+    private void maybeCelebrate(int beforeCount) {
+        if (beforeCount <= 0) return;          // 本来就没有，不响
+        if (adapter.getCount() > 0) return;    // 还有剩，不算完成
+        com.nchat.util.SoundFx.playFinish();
+        io.execute(() -> {
+            final int today = db.countToday();
+            final int total = db.countTotal();
+            ui.post(() -> toast("清空了！今天 " + today + " 条 · 累计 " + total + " 条"));
+        });
     }
 
     private void updateAiStatusHint() {
@@ -1195,6 +1235,11 @@ public class MainActivity extends AppCompatActivity {
     private void doMuteConfirm(NotifItem it) {
         io.execute(() -> {
             boolean ok = DaemonClient.muteChannel(it.pkg, it.uid, it.channel);
+            if (ok) {
+                // 本地也记一笔。没有这条记录，统计页就没法区分
+                // 「已经屏蔽的渠道」和「还在烦我的渠道」。
+                db.addMutedChannel(it.pkgUidChannel(), it.pkg, it.channel, it.channelName);
+            }
             ui.post(() -> {
                 if (ok) {
                     recordDecision(it, Decision.TYPE_MUTED, false, true);
@@ -1212,6 +1257,11 @@ public class MainActivity extends AppCompatActivity {
         // 聚合卡片：整组一起登记、一起记录。
         // 否则组内其它成员没进 handledThisSession，下次刷新还会冒出来，
         // 用户会觉得「已阅了怎么还有」。
+        // 一次用户操作只响一声。
+        // 聚合卡片内部会写 6 条记录，如果每条都响就变成机关枪了。
+        com.nchat.util.SoundFx.playTick();
+        com.nchat.util.SoundFx.vibrateTick();
+
         if (it.isGrouped()) {
             for (NotifItem m : it.allMembers()) recordOneDecision(m, type, todoPending);
             return;
@@ -1219,7 +1269,7 @@ public class MainActivity extends AppCompatActivity {
         recordOneDecision(it, type, todoPending);
     }
 
-    /** 单条记录（聚合卡片会逐条调用） */
+    /** 单条记录（聚合卡片会逐条调用）；**不负责音效**，见 recordDecision */
     private void recordOneDecision(NotifItem it, int type, boolean todoPending) {
         // 登记到本次会话的已处理集合，避免 onResume 重拉列表时它又冒出来
         if (it.key != null) handledThisSession.add(it.key);
@@ -1252,6 +1302,7 @@ public class MainActivity extends AppCompatActivity {
     private void advance() {
         int pos = viewPager.getCurrentItem();
         NotifItem cur = adapter.getItem(pos);
+        final int before = queue.size();
         if (cur != null) {
             queue.remove(cur);
             doneCount++;
@@ -1260,6 +1311,9 @@ public class MainActivity extends AppCompatActivity {
 
         if (queue.isEmpty()) {
             showEmpty(null);
+            // 从「还有一堆」变成「清空」的这一刻才放完成音效，
+            // 单纯刷新到空列表不该庆祝。
+            if (before > 0) maybeCelebrate(before);
         } else {
             int next = Math.min(pos, queue.size() - 1);
             viewPager.setCurrentItem(next, false);

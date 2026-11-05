@@ -22,6 +22,9 @@ public class NchatApp extends Application {
     public void onCreate() {
         super.onCreate();
         instance = this;
+        // 音效池在这里初始化：只用 applicationContext，
+        // 不持有 Activity 引用，避免内存泄漏。
+        com.nchat.util.SoundFx.init(this);
     }
 
     public static NchatApp get() {

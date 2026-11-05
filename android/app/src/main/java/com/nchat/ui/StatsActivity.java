@@ -136,11 +136,20 @@ public class StatsActivity extends AppCompatActivity {
         io.execute(() -> {
             final long since = sinceTs();
             final List<NchatDb.TypeCount> byType = db.statsByType(since);
-            final List<NchatDb.ChannelStat> byChannel = db.statsByChannel(3);
+            // 渠道画像：**排除已屏蔽的渠道**，且只要「不感兴趣」占比高的。
+            // 用户已经把某渠道关掉了，再在「该考虑屏蔽了」里列出来毫无意义，
+            // 只会让这份清单越来越长、越来越没用。
+            final List<NchatDb.ChannelStat> byChannel = db.statsByChannel(3, true, 0.25f);
             final int[] hours = db.hourHistogram();
             final int totalAll = db.countAll();
             final int total = sum(byType);
-            ui.post(() -> render(byType, byChannel, hours, total, totalAll));
+            final int today = db.countToday();
+            final int yesterday = db.countBetween(
+                    NchatDb.todayStart() - 86400000L, NchatDb.todayStart());
+            final List<NchatDb.DayCount> byDay = db.statsByDay(7);
+            final List<NchatDb.AppStat> byApp = db.statsByApp(3, true);
+            ui.post(() -> render(byType, byChannel, hours, total, totalAll,
+                    today, yesterday, byDay, byApp));
         });
     }
 
@@ -155,7 +164,9 @@ public class StatsActivity extends AppCompatActivity {
     }
 
     private void render(List<NchatDb.TypeCount> byType, List<NchatDb.ChannelStat> byChannel,
-                        int[] hours, int total, int totalAll) {
+                        int[] hours, int total, int totalAll,
+                        int today, int yesterday,
+                        List<NchatDb.DayCount> byDay, List<NchatDb.AppStat> byApp) {
         content.removeAllViews();
 
         if (total == 0) {
@@ -168,13 +179,37 @@ public class StatsActivity extends AppCompatActivity {
             return;
         }
 
-        // ── 概览 ──
+        // ── 概览：今天 / 昨天 / 累计 ──
         content.addView(sectionTitle("总览"));
         LinearLayout cards = new LinearLayout(this);
         cards.setOrientation(LinearLayout.HORIZONTAL);
-        cards.addView(statCard("已处理", String.valueOf(total), "条", 0xFF4ADE80), weightLp(0));
-        cards.addView(statCard("累计", String.valueOf(totalAll), "条", 0xFF60A5FA), weightLp(1));
+        cards.addView(statCard("今天", String.valueOf(today), "条", 0xFF4ADE80), weightLp(0));
+        cards.addView(statCard("昨天", String.valueOf(yesterday), "条", 0xFF60A5FA), weightLp(1));
+        cards.addView(statCard("累计", String.valueOf(totalAll), "条", 0xFFA78BFA), weightLp(2));
         content.addView(cards);
+
+        // 今日对比昨日的一句评价
+        if (today + yesterday > 0) {
+            TextView cmp = new TextView(this);
+            String txt;
+            if (yesterday == 0) {
+                txt = "今天已经处理了 " + today + " 条";
+            } else {
+                int diff = today - yesterday;
+                if (diff == 0) txt = "和昨天持平（" + today + " 条）";
+                else if (diff > 0) txt = "比昨天多处理了 " + diff + " 条 ↑";
+                else txt = "比昨天少 " + (-diff) + " 条";
+            }
+            cmp.setText(txt);
+            cmp.setTextColor(getColor(R.color.text_tertiary));
+            cmp.setTextSize(11);
+            cmp.setPadding(0, dp(8), 0, 0);
+            content.addView(cmp);
+        }
+
+        // ── 近 7 天柱状图 ──
+        content.addView(sectionTitle("近 7 天"));
+        content.addView(dayChart(byDay));
 
         // ── 决策分布（关键：已阅 / 不感兴趣 分开） ──
         content.addView(sectionTitle("决策分布"));
@@ -213,7 +248,28 @@ public class StatsActivity extends AppCompatActivity {
         }
         if (shown == 0) {
             TextView tv = new TextView(this);
-            tv.setText("样本还太少（每个渠道至少 3 条才会显示）");
+            tv.setText("暂时没有需要屏蔽的渠道 —— 已屏蔽的不再列出，剩下的都还算正常。");
+            tv.setTextColor(getColor(R.color.text_tertiary));
+            tv.setTextSize(12);
+            content.addView(tv);
+        }
+
+        // ── 最吵的 App 榜单（跳过已屏蔽渠道的记录）──
+        content.addView(sectionTitle("最吵的 App"));
+        TextView appHint = new TextView(this);
+        appHint.setText("按处理总量排序，已屏蔽的渠道不计入。");
+        appHint.setTextColor(getColor(R.color.text_tertiary));
+        appHint.setTextSize(11);
+        appHint.setPadding(0, 0, 0, dp(8));
+        content.addView(appHint);
+        int appShown = 0;
+        for (NchatDb.AppStat st : byApp) {
+            if (appShown++ >= 10) break;
+            content.addView(appRow(st));
+        }
+        if (appShown == 0) {
+            TextView tv = new TextView(this);
+            tv.setText("还没有足够的样本");
             tv.setTextColor(getColor(R.color.text_tertiary));
             tv.setTextSize(12);
             content.addView(tv);
@@ -384,6 +440,131 @@ public class StatsActivity extends AppCompatActivity {
     }
 
     /** 24 小时柱状图（简易，用字符高度表示） */
+    /**
+     * 近 N 天柱状图。
+     * 比时段图多一个「今天」高亮 —— 让用户一眼看到自己今天的成果。
+     */
+    private View dayChart(List<NchatDb.DayCount> days) {
+        int max = 1;
+        for (NchatDb.DayCount d : days) max = Math.max(max, d.count);
+
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.HORIZONTAL);
+        wrap.setGravity(Gravity.BOTTOM);
+        wrap.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(110)));
+
+        String todayKey = new java.text.SimpleDateFormat("MM-dd", java.util.Locale.CHINA)
+                .format(new java.util.Date());
+
+        for (NchatDb.DayCount d : days) {
+            boolean isToday = d.day.equals(todayKey);
+            LinearLayout col = new LinearLayout(this);
+            col.setOrientation(LinearLayout.VERTICAL);
+            col.setGravity(Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+            col.setLayoutParams(new LinearLayout.LayoutParams(0, dp(110), 1f));
+
+            // 数值标在柱子上方
+            TextView num = new TextView(this);
+            num.setText(d.count == 0 ? "" : String.valueOf(d.count));
+            num.setTextSize(9);
+            num.setTextColor(isToday ? 0xFF4ADE80 : getColor(R.color.text_tertiary));
+            num.setGravity(Gravity.CENTER);
+            col.addView(num);
+
+            View bar = new View(this);
+            int h = d.count == 0 ? dp(2) : Math.max(dp(4), dp(64) * d.count / max);
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(0, h, 1f);
+            blp.leftMargin = dp(3);
+            blp.rightMargin = dp(3);
+            bar.setLayoutParams(blp);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(3));
+            bg.setColor(d.count == 0 ? 0xFF2A2E38 : (isToday ? 0xFF4ADE80 : 0xFF60A5FA));
+            bar.setBackground(bg);
+            col.addView(bar);
+
+            TextView label = new TextView(this);
+            label.setText(d.day);
+            label.setTextSize(9);
+            label.setTextColor(isToday ? 0xFF4ADE80 : getColor(R.color.text_tertiary));
+            label.setGravity(Gravity.CENTER);
+            label.setPadding(0, dp(4), 0, 0);
+            col.addView(label);
+
+            wrap.addView(col);
+        }
+
+        LinearLayout outer = new LinearLayout(this);
+        outer.setOrientation(LinearLayout.VERTICAL);
+        outer.addView(wrap);
+
+        TextView summary = new TextView(this);
+        int sum = 0;
+        for (NchatDb.DayCount d : days) sum += d.count;
+        summary.setText("7 天共 " + sum + " 条 · 日均 " + (sum / Math.max(1, days.size())) + " 条");
+        summary.setTextColor(getColor(R.color.text_tertiary));
+        summary.setTextSize(10);
+        summary.setPadding(0, dp(6), 0, 0);
+        outer.addView(summary);
+        return outer;
+    }
+
+    /** 某个 App 的处理分布行 */
+    private View appRow(NchatDb.AppStat st) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(0, dp(7), 0, dp(7));
+
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView name = new TextView(this);
+        name.setText(com.nchat.NchatApp.get().appLabel(st.pkg));
+        name.setTextSize(13);
+        name.setTextColor(getColor(R.color.text_primary));
+        name.setSingleLine(true);
+        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        head.addView(name, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView cnt = new TextView(this);
+        cnt.setText(st.total + " 条");
+        cnt.setTextSize(12);
+        cnt.setTextColor(getColor(R.color.text_secondary));
+        head.addView(cnt);
+        row.addView(head);
+
+        // 分段条：已阅(绿) / 完成(深绿) / 不感兴趣(红) / 稍后(蓝)
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(5));
+        blp.topMargin = dp(5);
+        bar.setLayoutParams(blp);
+        int[][] parts = {
+                {st.seen, 0xFF4ADE80},
+                {st.done, 0xFF22C55E},
+                {st.ignore, 0xFFFF7A8A},
+                {st.later, 0xFF60A5FA}
+        };
+        for (int[] part : parts) {
+            if (part[0] <= 0) continue;
+            View seg = new View(this);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(5), part[0]);
+            lp.rightMargin = dp(1);
+            seg.setLayoutParams(lp);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(2));
+            bg.setColor(part[1]);
+            seg.setBackground(bg);
+            bar.addView(seg);
+        }
+        row.addView(bar);
+        return row;
+    }
+
     private View hourChart(int[] hours) {
         int max = 1;
         for (int h : hours) max = Math.max(max, h);

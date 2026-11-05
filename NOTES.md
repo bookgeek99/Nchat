@@ -978,3 +978,166 @@ Android 15 BAL 拦截小米推送代发的 PendingIntent， 返回 true 但界�
 -  里  /  与 daemon 已有的同名符号冲突，
   必须写全限定名  / 。
 - 局部变量  和方法里已有的  重名，改名 。
+
+---
+
+# 第十四轮：正反馈与统计增强
+
+## 需求
+
+1. 处理完所有通知后，显示今天处理了多少、累计多少。
+2. 每次点击处理，加一个「解压」音效（撕纸/滴水那种点的爽的）。
+3. 统计界面多展示一些图表。
+4. 应用分析里，已屏蔽的渠道不再展示，只展示「还没屏蔽但老被点不感兴趣」的。
+
+## 一、完成页的正反馈
+
+`showEmpty()` 原来只有一句「今天已处理 N 条」。现在改成：
+
+```
+✓  全部处理完了
+   今天已处理 52 条 · 累计 282 条
+```
+
+`formatDoneSummary()` 按四种情况给不同措辞：
+
+| 情况 | 文案 |
+|---|---|
+| 今天和累计都为 0 | 通知栏很干净 |
+| 今天 0，有累计 | 累计已处理 N 条 |
+| 今天 == 累计（首次用） | 今天已处理 N 条 |
+| 一般情况 | 今天已处理 N 条 · 累计 M 条 |
+
+另外「从有到无」的那一刻（`advance()` 里 `before > 0` 且队列清空）会：
+- 播完成音效
+- 弹一句 `清空了！今天 X 条 · 累计 Y 条`
+
+单纯刷新到空列表不触发，避免每次进 App 都庆祝一遍。
+
+## 二、音效
+
+### 音频素材：自己合成，不引外部文件
+
+`/tmp/gen_sfx.py` 用 Python 的 `wave` 模块直接算波形生成两个 wav：
+
+**`tick.wav`** — 处理单条，90ms，7.9KB
+水滴感的做法是**一个快速下滑的短音**（1750Hz → 1150Hz，`p ** 0.55` 曲线），
+这种"pui"的下坠就是水滴的听感核心。
+加了 0.22 的二次谐波避免变成纯电子蜂鸣，
+前 6ms 做了 attack 包络防爆音。
+
+**`finish.wav`** — 全部处理完，490ms，43KB
+C6 / E6 / G6 三个上行音 + 尾音（高八度、低音量、慢衰减），
+营造"叮—叮—叮↗"的完成感。
+
+### 播放：SoundPool 而非 MediaPlayer
+
+音效只有几十毫秒，而用户会连续快点（一批十几条）。
+MediaPlayer 每次都要 prepare，手感会明显拖沓；
+SoundPool 预加载进内存，重复触发几乎零延迟。
+
+`util/SoundFx` 在 `NchatApp.onCreate()` 里初始化（只用 applicationContext，不持有 Activity）。
+
+### 一次操作只响一声
+
+`recordDecision` 里播，`recordOneDecision` 里**不**播。
+因为聚合卡片会调用 `recordOneDecision` 六次，如果那里播就成了机关枪。
+放在 `recordDecision` 入口处统一播一次。
+
+### 开关
+
+`SharedPreferences("nchat_sound")` 三个键：
+`sound_enabled`（总开关，默认开）、`sound_volume`（默认 0.7）、`sound_vibrate`（默认开）。
+震动 14ms，静音场景下还有触觉反馈。
+
+## 三、统计页增强
+
+### 新增内容
+
+- **总览**：今天 / 昨天 / 累计 三张卡片 + 一句同比评价（「比昨天多处理了 N 条 ↑」）
+- **近 7 天柱状图**：今天的柱子高亮成绿色，柱顶标数值，底部有日均
+- **最吵的 App 榜单**：按处理总量排序，每行一个分段条
+  （已阅绿 / 完成深绿 / 不感兴趣红 / 稍后蓝）
+- 原有的渠道画像、决策分布、活跃时段保留
+
+### 新增的 DB 方法
+
+```java
+countToday()                              // 今天
+countBetween(from, to)                    // 任意区间，用于算昨天
+statsByDay(days)                          // 近 N 天每日量，无数据补 0
+statsByApp(minTotal, excludeMuted)        // 按 App 聚合
+statsByChannel(minTotal, excludeMuted, minNegRatio)  // 扩展了后两个参数
+```
+
+`statsByDay` 补 0 很关键 —— 不补的话柱子间距不均匀，看着不像图表。
+
+## 四、已屏蔽渠道不再显示
+
+### 这里原来有个洞
+
+之前屏蔽**只调 daemon，本地一点记录都没有**。
+后果：
+- 统计页分不清「已屏蔽」和「还在烦我」
+- 重启后 UI 状态丢失
+- 渠道画像里永远挂着已经处理掉的东西
+
+所以加了 DB v5 的 `muted_channels` 表：
+
+```sql
+CREATE TABLE muted_channels (
+  uid_channel TEXT PRIMARY KEY,
+  pkg TEXT, channel_id TEXT, channel_name TEXT, muted_at INTEGER
+)
+```
+
+`doMuteConfirm` 成功后 `db.addMutedChannel(...)`。
+`ChannelStat` 也补了 `uidChannel` 字段，才能和屏蔽表对上。
+
+### 过滤逻辑
+
+统计页的渠道画像现在是：
+
+```java
+db.statsByChannel(3, /* excludeMuted */ true, /* minNegRatio */ 0.25f)
+```
+
+- `excludeMuted=true`：已屏蔽的直接跳过
+- `minNegRatio=0.25`：只留「不感兴趣占比 ≥ 25%」的
+
+这样这份清单才真的是「还没处理、但确实该考虑屏蔽」的。
+「最吵的 App」榜单同样传 `excludeMuted=true`。
+
+空列表的文案也改了：
+> 暂时没有需要屏蔽的渠道 —— 已屏蔽的不再列出，剩下的都还算正常。
+
+## 五、顺手修的一个崩溃
+
+`RejectedExecutionException`：
+`onDestroy` 里 `io.shutdownNow()` 之后，`ensureDaemonThenLoad` 的
+`postDelayed` 回调仍可能醒来，往已关闭的线程池提交任务，直接崩。
+
+修法：`submitIo(Runnable)` 包一层，池关闭时返回 false 而不抛；
+`loadNotifications` 开头加 `if (isFinishing() || isDestroyed()) return;`
+
+## 六、验证
+
+- 完成页：`今天已处理 52 条 · 累计 282 条` ✓
+- 统计页：今天 52 / 昨天 0 / 累计 282，近 7 天柱状图 11-05 高亮 ✓
+- 最吵的 App：支付宝 38 条、哔哩哔哩 23 条… ✓
+- 渠道画像：已屏蔽的不再出现 ✓
+- 处理单条后待处理数 6 → 5 ✓
+- `logcat -b crash` 中 `com.nchat` 记录数 0 ✓
+
+## 七、踩的坑
+
+- **脚本重复执行导致方法重复定义**：`f18_db2.py` 跑了两遍，
+  `addMutedChannel` 等四个方法各出现两次，编译报 `already defined`。
+  用 `sed` 删重复块时又删多了 2 行，留下 `} }` 残壳，再修一次才干净。
+- **shell 的 `!` 历史展开**：`python3 -c "... if (!submitted) ..."` 被 bash 当成
+  历史展开，报 `bash: !submitIo: event not found`。
+  含 `!` 的脚本必须写成文件再执行，不能用 `-c` 内联。
+- **`io.execute(() -> {...})` 改成带返回值的形式**时，
+  要注意尾部的 `});` 之后补 `if (!submitted) return;`，
+  位置搞错会变成在 lambda 里判断，永远为 true。
+
