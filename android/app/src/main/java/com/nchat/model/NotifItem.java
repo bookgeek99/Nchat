@@ -45,56 +45,23 @@ public class NotifItem {
     public String jumpReason;
     /** 跳转后的前台 Activity */
     public String jumpTop;
-
-    // ==================== 相似通知聚合 ====================
     /**
-     * 同一 App 反复发来的相似通知会被合并成一组，只留第一条当代表卡片，
-     * 其余挂在这里。空列表 = 没有相似兄弟，普通单条。
-     */
-    public List<NotifItem> groupMembers = new ArrayList<>();
-
-    /** 组内总条数（含代表自己）。1 表示没聚合。 */
-    public int groupSize = 1;
-
-    public boolean isGrouped() {
-        return groupSize > 1;
-    }
-
-    /** 所有成员（含自己）的通知 key —— 批量 cancel / 批量记录用 */
-    public List<String> allKeys() {
-        List<String> ks = new ArrayList<>();
-        if (key != null) ks.add(key);
-        for (NotifItem m : groupMembers) {
-            if (m != null && m.key != null) ks.add(m.key);
-        }
-        return ks;
-    }
-
-    /** 所有成员（含自己），方便遍历 */
-    public List<NotifItem> allMembers() {
-        List<NotifItem> all = new ArrayList<>();
-        all.add(this);
-        all.addAll(groupMembers);
-        return all;
-    }
-
-    /**
-     * 两条通知是否「相似」—— 聚合判定。
+     * 两条通知是否「相似」—— 用于**分组展示**，不是合并。
      *
-     * 判定维度刻意保守：宁可少聚合，也不要错误地把不同事情合并，
-     * 因为一旦合并，用户点「已阅」会一次性清掉整组，误合并 = 误删。
-     *
-     * 必须同时满足：
-     *   1) 同一个 App（pkg 相同）
-     *   2) 同一个渠道（channel 相同；渠道不同说明是不同类型的推送）
-     *   3) 标题高度相似（归一化后相同，或一个是另一个的前缀）
-     * 正文不参与判定 —— 同标题的不同正文（如「新消息：任务A」/「新消息：任务B」）
-     * 恰恰就是要聚合的典型场景。
+     * 相似的条目会被放进同一个页面里上下排列，
+     * 但每一条仍然独立展示、独立操作、独立记录决策。
+     * 即使判定错了，也只是同一屏里多出一条不相干的通知，
+     * 不会出现「点一次误删一堆」的风险。
      */
     public boolean isSimilarTo(NotifItem o) {
         if (o == null) return false;
         if (pkg == null || !pkg.equals(o.pkg)) return false;
-        if (channel == null ? o.channel != null : !channel.equals(o.channel)) return false;
+        // 渠道必须相同，且都不为空。
+        // 渠道为 null 时一律不参与分组：拿不准就不合并，
+        // 误分组会让用户在一屏里看到两个不相干的通知，比分开更糟。
+        if (channel == null || channel.isEmpty()) return false;
+        if (o.channel == null || o.channel.isEmpty()) return false;
+        if (!channel.equals(o.channel)) return false;
         String a = normTitle(displayTitle());
         String b = normTitle(o.displayTitle());
         if (a.isEmpty() || b.isEmpty()) return false;

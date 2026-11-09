@@ -1,141 +1,206 @@
 package com.nchat.ui.adapter;
-
 import android.graphics.drawable.GradientDrawable;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
-
 import com.nchat.NchatApp;
 import com.nchat.R;
 import com.nchat.model.NotifCategory;
 import com.nchat.model.NotifItem;
+import com.nchat.util.NotifGrouper;
 import com.nchat.util.TimeUtil;
-
 import java.util.ArrayList;
 import java.util.List;
-
 /**
- * 卡片流适配器（ViewPager2 使用）。
+ * 「页」适配器：一页 = 一组相似通知，纵向排列。
+ *
+ * 交互模型（第十三/十四轮之后重新设计的）：
+ *   - **卡片本身不带按钮**，只展示内容
+ *   - **点卡片 = 立即办理这一条**（打开通知），办理完这张卡片自己消失
+ *   - 其余操作（稍后 / 已阅 / 不感兴趣）走底部的公共按钮，
+ *     作用于「当前选中的那一条」
+ *   - 选中态：点一下卡片即选中（会高亮），底部按钮默认作用于第一条
+ *
+ * 这样一屏里能塞更多内容，也不必每条都重复四个按钮。
  */
 public class CardAdapter extends RecyclerView.Adapter<CardAdapter.VH> {
 
-    public interface OnNotifActionClick {
-        void onActionClick(NotifItem item, int actionIndex);
-    }
-
-    /** 点卡片本体 = 点「立即阅读 / 立即办理」，行为完全一致 */
-    public interface OnCardClickListener {
+    public interface OnCardAction {
+        /** 点了卡片正文 = 立即办理这条 */
         void onCardClick(NotifItem item);
+        /** 点卡片的原通知 action 按钮 */
+        void onNotifAction(NotifItem item, int actionIndex);
     }
-
-    private final List<NotifItem> items = new ArrayList<>();
-    private OnNotifActionClick actionListener;
-    private OnCardClickListener cardListener;
-
-    public void setOnNotifActionClick(OnNotifActionClick l) {
-        this.actionListener = l;
+    private final List<List<NotifItem>> pages = new ArrayList<>();
+    private OnCardAction listener;
+    /** 当前选中的条目 —— 底部公共按钮作用于它 */
+    private NotifItem selected;
+    public void setOnCardAction(OnCardAction l) {
+        this.listener = l;
     }
-
-    public void setOnCardClickListener(OnCardClickListener l) {
-        this.cardListener = l;
-    }
-
-    public void submit(List<NotifItem> list) {
-        items.clear();
-        if (list != null) items.addAll(list);
+    public void submit(List<List<NotifItem>> newPages) {
+        pages.clear();
+        if (newPages != null) pages.addAll(newPages);
+        // 选中的条目如果已经不在任何页里了，清掉选中态
+        if (selected != null && !contains(selected)) selected = null;
         notifyDataSetChanged();
     }
-
-    public NotifItem getItem(int pos) {
-        return pos >= 0 && pos < items.size() ? items.get(pos) : null;
+    private boolean contains(NotifItem it) {
+        for (List<NotifItem> p : pages) {
+            if (p.contains(it)) return true;
+        }
+        return false;
     }
-
+    /** 当前选中；没有选中时返回该页第一条 */
+    public NotifItem getSelected(int pageIdx) {
+        if (selected != null && contains(selected)) return selected;
+        return getItem(pageIdx);
+    }
+    public void setSelected(NotifItem it) {
+        if (selected == it) return;
+        selected = it;
+        notifyDataSetChanged();
+    }
+    public List<NotifItem> getPage(int pageIdx) {
+        return pageIdx >= 0 && pageIdx < pages.size() ? pages.get(pageIdx) : null;
+    }
+    public NotifItem getItem(int pageIdx) {
+        List<NotifItem> page = getPage(pageIdx);
+        return page == null || page.isEmpty() ? null : page.get(0);
+    }
     public int getCount() {
-        return items.size();
+        return pages.size();
     }
-
+    /** 总条数（不是页数）—— 进度显示用 */
+    public int getTotalItems() {
+        int n = 0;
+        for (List<NotifItem> p : pages) n += p.size();
+        return n;
+    }
+    /**
+     * 从某页里移除一条。
+     * @return 该页是否已空
+     */
+    public boolean removeItem(int pageIdx, NotifItem it) {
+        if (pageIdx < 0 || pageIdx >= pages.size()) return false;
+        List<NotifItem> page = pages.get(pageIdx);
+        if (!page.remove(it)) return false;
+        if (selected == it) {
+            selected = page.isEmpty() ? null : page.get(0);
+        }
+        if (page.isEmpty()) {
+            pages.remove(pageIdx);
+            notifyItemRemoved(pageIdx);
+            return true;
+        }
+        notifyItemChanged(pageIdx);
+        return false;
+    }
     @NonNull
     @Override
     public VH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
         View v = LayoutInflater.from(parent.getContext())
-                .inflate(R.layout.item_card, parent, false);
+                .inflate(R.layout.page_cards, parent, false);
         return new VH(v);
     }
-
     @Override
     public void onBindViewHolder(@NonNull VH h, int position) {
-        NotifItem it = items.get(position);
+        List<NotifItem> page = pages.get(position);
+        h.llCards.removeAllViews();
+        String label = NotifGrouper.pageLabel(page);
+        if (label.isEmpty()) {
+            h.tvPageHeader.setVisibility(View.GONE);
+        } else {
+            h.tvPageHeader.setVisibility(View.VISIBLE);
+            h.tvPageHeader.setText(label + " · 点卡片即办理");
+        }
+        for (NotifItem it : page) {
+            h.llCards.addView(buildCard(h, it));
+        }
+    }
+    /** 构建单条通知的卡片 View（无按钮） */
+    private View buildCard(VH h, NotifItem it) {
+        View v = LayoutInflater.from(h.itemView.getContext())
+                .inflate(R.layout.item_card_row, h.llCards, false);
         NchatApp app = NchatApp.get();
 
-        h.tvAppName.setText(app.appLabel(it.pkg));
-        h.ivIcon.setImageDrawable(app.appIcon(it.pkg));
-        h.tvTime.setText(TimeUtil.relative(it.postTime));
-        h.tvTitle.setText(it.displayTitle());
+        ImageView ivIcon = v.findViewById(R.id.ivIcon);
+        TextView tvAppName = v.findViewById(R.id.tvAppName);
+        TextView tvTime = v.findViewById(R.id.tvTime);
+        TextView tvCategory = v.findViewById(R.id.tvCategory);
+        TextView tvChannel = v.findViewById(R.id.tvChannel);
+        TextView tvTitle = v.findViewById(R.id.tvTitle);
+        ScrollView svBody = v.findViewById(R.id.svBody);
+        TextView tvBody = v.findViewById(R.id.tvBody);
+        View vCatBar = v.findViewById(R.id.vCatBar);
+        View hsvActions = v.findViewById(R.id.hsvActions);
+        LinearLayout llNotifActions = v.findViewById(R.id.llNotifActions);
+
+        ivIcon.setImageDrawable(app.appIcon(it.pkg));
+        tvAppName.setText(app.appLabel(it.pkg));
+        tvTime.setText(TimeUtil.relative(it.postTime));
+        tvTitle.setText(it.displayTitle());
 
         String body = it.body();
-        h.tvBody.setText(body);
-        h.tvBody.setVisibility(body.isEmpty() ? View.GONE : View.VISIBLE);
+        tvBody.setText(body);
+        svBody.setVisibility(body.isEmpty() ? View.GONE : View.VISIBLE);
 
         NotifCategory cat = it.aiCategory == null ? NotifCategory.OTHER : it.aiCategory;
-        h.tvCategory.setText(cat.label);
-        h.tvCategory.setTextColor(cat.color);
-        setBarColor(h.vCatBar, cat.color);
+        tvCategory.setText(cat.label);
+        tvCategory.setTextColor(cat.color);
+        setBarColor(vCatBar, cat.color);
+        tvChannel.setText(it.channelName == null ? "" : it.channelName);
 
-        String chName = it.channelName == null ? "" : it.channelName;
-
-        // 聚合卡片：渠道行后面标出「N 条相似」，正文换成组内摘要
-        if (it.isGrouped()) {
-            h.tvChannel.setText((chName.isEmpty() ? "" : chName + " · ")
-                    + it.groupSize + " 条相似");
-            String preview = com.nchat.util.NotifGrouper.memberPreview(it);
-            if (!preview.isEmpty()) {
-                h.tvBody.setText(preview);
-                h.tvBody.setVisibility(View.VISIBLE);
-            }
-        } else {
-            h.tvChannel.setText(chName);
-        }
-
-        // 整张卡片可点 = 立即阅读 / 立即办理。
-        // 用 setOnClickListener 而不是 OnTouchListener，
-        // 这样 ViewPager2 的左右滑动、ScrollView 的滚动都不受影响。
-        h.itemView.setClickable(true);
-        h.itemView.setOnClickListener(v -> {
-            if (cardListener != null) cardListener.onCardClick(it);
-        });
-
-        // 原通知的快捷 action
-        h.llNotifActions.removeAllViews();
+        // 原通知自带 action（这类是通知本身提供的快捷操作，保留）
+        llNotifActions.removeAllViews();
         if (it.actions != null && !it.actions.isEmpty()) {
-            h.hsvActions.setVisibility(View.VISIBLE);
+            hsvActions.setVisibility(View.VISIBLE);
             for (int i = 0; i < it.actions.size(); i++) {
                 final int idx = i;
-                TextView btn = new TextView(h.itemView.getContext());
+                TextView btn = new TextView(v.getContext());
                 btn.setText(it.actions.get(i));
-                btn.setTextSize(12);
+                btn.setTextSize(11);
                 btn.setTextColor(0xFF9AA5B8);
                 btn.setBackgroundResource(R.drawable.bg_chip);
                 LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-                lp.rightMargin = dp(h.itemView, 8);
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(v, 8);
                 btn.setLayoutParams(lp);
-                btn.setPadding(dp(h.itemView, 14), dp(h.itemView, 8), dp(h.itemView, 14), dp(h.itemView, 8));
-                btn.setOnClickListener(v -> {
-                    if (actionListener != null) actionListener.onActionClick(it, idx);
+                btn.setPadding(dp(v, 12), dp(v, 6), dp(v, 12), dp(v, 6));
+                btn.setOnClickListener(b -> {
+                    if (listener != null) listener.onNotifAction(it, idx);
                 });
-                h.llNotifActions.addView(btn);
+                llNotifActions.addView(btn);
             }
         } else {
-            h.hsvActions.setVisibility(View.GONE);
+            hsvActions.setVisibility(View.GONE);
         }
-    }
 
+        // 选中态描边：底部按钮作用于「选中的这条」，视觉上必须能看出来
+        boolean isSel = (selected == it);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(v, 14));
+        bg.setColor(0xFF1A1F29);
+        bg.setStroke(dp(v, isSel ? 2 : 0), 0xFF4ADE80);
+        v.setBackground(bg);
+
+        // 点卡片 = 立即办理
+        v.setClickable(true);
+        v.setOnClickListener(b -> {
+            if (listener != null) listener.onCardClick(it);
+        });
+
+        return v;
+    }
     private void setBarColor(View v, int color) {
         GradientDrawable d = new GradientDrawable();
         d.setShape(GradientDrawable.RECTANGLE);
@@ -143,35 +208,22 @@ public class CardAdapter extends RecyclerView.Adapter<CardAdapter.VH> {
         d.setColor(color);
         v.setBackground(d);
     }
-
     private int dp(View v, int val) {
         return (int) (val * v.getResources().getDisplayMetrics().density);
     }
-
     @Override
     public int getItemCount() {
-        return items.size();
+        return pages.size();
     }
-
     static class VH extends RecyclerView.ViewHolder {
-        ImageView ivIcon;
-        TextView tvAppName, tvTime, tvCategory, tvChannel, tvTitle, tvBody;
-        View vCatBar;
-        LinearLayout llNotifActions;
-        View hsvActions;
-
+        TextView tvPageHeader;
+        LinearLayout llCards;
+        ScrollView svPage;
         VH(@NonNull View v) {
             super(v);
-            ivIcon = v.findViewById(R.id.ivIcon);
-            tvAppName = v.findViewById(R.id.tvAppName);
-            tvTime = v.findViewById(R.id.tvTime);
-            tvCategory = v.findViewById(R.id.tvCategory);
-            tvChannel = v.findViewById(R.id.tvChannel);
-            tvTitle = v.findViewById(R.id.tvTitle);
-            tvBody = v.findViewById(R.id.tvBody);
-            vCatBar = v.findViewById(R.id.vCatBar);
-            llNotifActions = v.findViewById(R.id.llNotifActions);
-            hsvActions = v.findViewById(R.id.hsvActions);
+            tvPageHeader = v.findViewById(R.id.tvPageHeader);
+            llCards = v.findViewById(R.id.llCards);
+            svPage = v.findViewById(R.id.svPage);
         }
     }
 }

@@ -3,78 +3,62 @@ import com.nchat.model.NotifItem;
 import java.util.ArrayList;
 import java.util.List;
 /**
- * 相似通知聚合。
+ * 相似通知「分组」—— 注意是分组，**不是合并**。
  *
- * 场景：同一个 App 在短时间内反复推同一类通知
- * （「新消息：任务A已完成」「新消息：任务B已完成」…十几条），
- * 逐条看没什么意义，用户想要的是一次「已阅」全部清掉。
+ * 设计目标的转变：
+ *   第一版把相似通知合并成一张卡片，只留一个「已阅 N 条」按钮。
+ *   这等于替用户做了判断：万一两件事其实不一样，用户就没法分别处理了。
  *
- * 做法：把满足 {@link NotifItem#isSimilarTo} 的条目合并到第一条上，
- * 第一条的 groupMembers 存其余成员，groupSize 存总数。
- * 合并后的卡片在 UI 上显示「N 条相似」，操作时对整组生效。
+ *   现在改成：相似通知**仍然是各自独立的条目**，有自己的按钮、自己的决策记录，
+ *   只是被放进同一个「页」里上下排列展示。
+ *   一个页面 = 一组相似通知，用户能在一屏里连续处理，不用左右翻页，
+ *   但每一条还是自己决定去留。
  *
- * 设计取舍：
- *   - **只做单层聚合**，不做多级。通知栏里同 App 同渠道的相似通知，
- *     通常也就 2~10 条，一层就够。
- *   - **保持原有顺序**：以每条通知第一次出现的位置为准，
- *     组内其它成员从队列里移除，代表卡片留在原位。
- *   - 不做基于时间的窗口限制。通知栏里的东西本来就是「当前还没处理的」，
- *     同一渠道同标题的，不管隔多久都该一起看。
+ * 数据结构：返回 List<List<NotifItem>>。外层是页，内层是这一页里的条目。
+ * 单条通知就是只有一个元素的页。
  */
 public final class NotifGrouper {
     private NotifGrouper() {}
     /**
-     * 就地聚合。返回的列表里每个元素都可能是「组代表」。
-     * 输入的 list 不会被修改。
+     * 把通知按「相似」分组成页。
+     * 组的顺序 = 组内第一条在输入里的顺序（保持通知栏原有次序）。
+     * 组内顺序 = 输入顺序（通常最新在前）。
      */
-    public static List<NotifItem> group(List<NotifItem> input) {
-        if (input == null || input.size() <= 1) return input;
-        List<NotifItem> out = new ArrayList<>();
+    public static List<List<NotifItem>> group(List<NotifItem> input) {
+        List<List<NotifItem>> pages = new ArrayList<>();
+        if (input == null || input.isEmpty()) return pages;
         for (NotifItem it : input) {
             if (it == null) continue;
-            // 找已有组代表里第一个相似且还没满的
-            NotifItem host = findHost(out, it);
+            List<NotifItem> host = findGroup(pages, it);
             if (host == null) {
-                // 自己当代表。注意：从待办还原的条目已有 decisionRowId，
-                // 不能被别人吞并（它们的 key 在通知栏里已不存在），
-                // 但可以被其它同类吸收进去 —— 这里统一当代表处理。
-                it.groupMembers = new ArrayList<>();
-                it.groupSize = 1;
-                out.add(it);
+                List<NotifItem> page = new ArrayList<>();
+                page.add(it);
+                pages.add(page);
             } else {
-                host.groupMembers.add(it);
-                host.groupSize = host.groupMembers.size() + 1;
-                // 组的时间取最新一条：用户看到「刚刚」比看到「3小时前」更符合预期
-                if (it.postTime > host.postTime) host.postTime = it.postTime;
+                host.add(it);
             }
         }
-        return out;
+        return pages;
     }
-    private static NotifItem findHost(List<NotifItem> out, NotifItem it) {
-        for (NotifItem host : out) {
-            // 从待办还原的条目单独站着，不吞也不被吞
-            if (host.fromTodo != it.fromTodo) continue;
-            if (host.isSimilarTo(it)) return host;
+    private static List<NotifItem> findGroup(List<List<NotifItem>> pages, NotifItem it) {
+        for (List<NotifItem> page : pages) {
+            NotifItem first = page.get(0);
+            // 从待办还原的条目单独站着：它们的 key 在通知栏里已经不存在了，
+            // 和真实通知混在一起会让整组操作的含义变得含糊。
+            if (first.fromTodo != it.fromTodo) continue;
+            if (first.isSimilarTo(it)) return page;
         }
         return null;
     }
-    /** 组内所有通知的标题摘要，用于卡片展示（最多取 3 条） */
-    public static String memberPreview(NotifItem host) {
-        if (host == null || !host.isGrouped()) return "";
-        StringBuilder sb = new StringBuilder();
-        int shown = 0;
-        for (NotifItem m : host.groupMembers) {
-            if (shown >= 3) break;
-            String b = m.body();
-            if (b.isEmpty()) b = m.displayTitle();
-            if (b.isEmpty()) continue;
-            if (sb.length() > 0) sb.append("  ·  ");
-            sb.append(b);
-            shown++;
-        }
-        if (host.groupSize - 1 > shown) {
-            sb.append("  ·  …等 ").append(host.groupSize).append(" 条");
-        }
-        return sb.toString();
+    /** 一页里有多条时，给个「N 条相似」的抬头文案 */
+    public static String pageLabel(List<NotifItem> page) {
+        if (page == null || page.size() <= 1) return "";
+        return page.size() + " 条相似";
+    }
+    /** 这一页里所有条目（用于批量登记 handledThisSession） */
+    public static List<NotifItem> flatten(List<List<NotifItem>> pages) {
+        List<NotifItem> all = new ArrayList<>();
+        for (List<NotifItem> page : pages) all.addAll(page);
+        return all;
     }
 }

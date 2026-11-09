@@ -77,7 +77,11 @@ public class MainActivity extends AppCompatActivity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newFixedThreadPool(2);
 
-    private final List<NotifItem> queue = new ArrayList<>();
+    /**
+     * 卡片数据：外层是页，内层是这一页里的通知。
+     * 一页 = 一组相似通知，上下排列，但每条独立操作。
+     */
+    private final List<List<NotifItem>> pages = new ArrayList<>();
     private int totalCount = 0;
     private int doneCount = 0;
 
@@ -148,22 +152,32 @@ public class MainActivity extends AppCompatActivity {
                 updateProgress();
             }
         });
-        // 点卡片本体 = 立即阅读/立即办理。
-        // 聚合卡片点进去只会跳一条（代表卡片那条），
-        // 想要逐条挑可以去通知栏，或者先展开 —— 这里保持简单。
-        adapter.setOnCardClickListener(this::doReadNow);
-        adapter.setOnNotifActionClick((item, idx) -> {
-            io.execute(() -> {
-                boolean ok = DaemonClient.triggerAction(item.key, idx);
-                ui.post(() -> {
-                    if (ok) {
-                        recordDecision(item, Decision.TYPE_DONE, false, true);
-                        advance();
-                    } else {
-                        toast("操作失败");
-                    }
+        // 每条通知卡片上的四个按钮，各自独立作用于自己那一条。
+        // 相似通知虽然是同页上下排列，但互不影响。
+        // 卡片只有两种交互：
+        //   1. 点卡片正文 = 立即办理这一条（打开通知），办完这张卡自己消失
+        //   2. 点卡片上的原通知 action 按钮 = 触发该 action
+        // 其余操作（稍后/已阅/不感兴趣）走底部公共按钮，
+        // 作用于「当前选中的那一条」（默认是当前页第一条）。
+        adapter.setOnCardAction(new CardAdapter.OnCardAction() {
+            @Override
+            public void onCardClick(NotifItem item) {
+                doReadNow(item);
+            }
+            @Override
+            public void onNotifAction(NotifItem item, int actionIndex) {
+                io.execute(() -> {
+                    boolean ok = DaemonClient.triggerAction(item.key, actionIndex);
+                    ui.post(() -> {
+                        if (ok) {
+                            recordDecision(item, Decision.TYPE_DONE, false, true);
+                            advanceItem(item);
+                        } else {
+                            toast("操作失败");
+                        }
+                    });
                 });
-            });
+            }
         });
     }
 
@@ -272,8 +286,10 @@ public class MainActivity extends AppCompatActivity {
         // 这里推进卡片（而不是在 doReadNow 里 advance），
         // 否则我们一重排就把刚起来的 App 压回去了。
         if (pendingJump) {
+            // 先取出是哪一条跳走的 —— confirmJumpIfPending 会把它清空
+            final NotifItem jumped = pendingJumpItem;
             confirmJumpIfPending(true);   // 离开前台 = 确实跳出去了，记成功
-            advance();
+            advanceItem(jumped);          // 只移除这一条，同页其它不受影响
             justJumped = true;   // 标记这一趟是"跳转后返回"，onResume 不要重建列表
         }
     }
@@ -480,13 +496,8 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
             }
-
-            // 相似通知聚合：同一 App 同渠道同标题的反复推送合并成一张卡片，
-            // 一次「已阅」就把整组清掉，不用逐条点。
-            // 注意放在分类之后、applyLoaded 之前 —— 组代表卡片要带上正确的分类。
-            List<NotifItem> grouped = com.nchat.util.NotifGrouper.group(filtered);
-
-            ui.post(() -> applyLoaded(grouped, st.error, showToast));
+            // 分组在 applyLoaded 里做：它把 List<NotifItem> 转成 List<List<NotifItem>>。
+            ui.post(() -> applyLoaded(filtered, st.error, showToast));
 
             if (!needAi.isEmpty()) {
                 ui.post(() -> {
@@ -534,12 +545,12 @@ public class MainActivity extends AppCompatActivity {
 
     private void applyLoaded(List<NotifItem> list, String error, boolean showToast) {
         readyOnce = true;
-        queue.clear();
-        queue.addAll(list);
+        pages.clear();
+        pages.addAll(com.nchat.util.NotifGrouper.group(list));
         totalCount = list.size();
         doneCount = 0;
 
-        adapter.submit(queue);
+        adapter.submit(pages);
         updateAiStatusHint();
 
         if (list.isEmpty()) {
@@ -645,11 +656,24 @@ public class MainActivity extends AppCompatActivity {
     // ==================== 进度 ====================
 
     private void updateProgress() {
-        int remain = adapter.getCount();
-        int idx = viewPager.getCurrentItem();
-        tvProgressTitle.setText(remain == 0 ? "已完成" : "待处理 " + remain);
-        if (remain > 0) {
-            tvProgressSub.setText((Math.min(idx + 1, remain)) + " / " + remain);
+        // 进度按「条」算，不按「页」算 —— 用户关心的是还剩几条通知，
+        // 至于它们被分成了几页是内部实现。
+        int remainItems = adapter.getTotalItems();
+        int pageIdx = viewPager.getCurrentItem();
+        int pageCount = adapter.getCount();
+        tvProgressTitle.setText(remainItems == 0 ? "已完成" : "待处理 " + remainItems);
+        if (remainItems > 0) {
+            // 「3 / 15 · 第 2 页」既有条数也有分组信息
+            String sub = (Math.min(doneCount + 1, totalCount)) + " / " + totalCount;
+            List<NotifItem> cur = adapter.getPage(pageIdx);
+            if (pageCount > 1 || (cur != null && cur.size() > 1)) {
+                String pageInfo = "第 " + (pageIdx + 1) + "/" + pageCount + " 页";
+                if (cur != null && cur.size() > 1) {
+                    pageInfo += " · 本页 " + cur.size() + " 条";
+                }
+                sub = sub + " · " + pageInfo;
+            }
+            tvProgressSub.setText(sub);
             progressBar.setProgress((int) ((doneCount * 100f) / Math.max(1, totalCount)));
         } else {
             tvProgressSub.setText("");
@@ -660,31 +684,30 @@ public class MainActivity extends AppCompatActivity {
     // ==================== 按钮渲染 ====================
 
     private void renderActionsFor(int pos) {
-        NotifItem it = adapter.getItem(pos);
-        rowPrimary.removeAllViews();
-        rowSecondary.removeAllViews();
-
-        if (it == null) {
-            // 没有卡片了：整块底部区域（渠道行 + 按钮区）一起收起，
-            // 不能只隐藏按钮而留下渠道行。
+        // 底部按钮的作用范围：
+        //   立即办理 → 只作用于**第 1 条**
+        //   稍后 / 已阅 / 不感兴趣 → 作用于**当前这一页的所有卡片**
+        //
+        // 一页里是同一批相似通知，「已阅/不感兴趣」对整批下判断很自然；
+        // 而「办理」是一条具体的事，必须一次一条，否则用户会漏看内容。
+        List<NotifItem> page = adapter.getPage(pos);
+        if (page == null || page.isEmpty()) {
             hideActionArea();
             return;
         }
+        final NotifItem first = page.get(0);
+        final List<NotifItem> batch = new ArrayList<>(page);
 
-        // 先让容器可见再 addView，否则子 View 会被测量成 0x0
+        rowPrimary.removeAllViews();
+        rowSecondary.removeAllViews();
         showBottom();
-        renderChannelRow(it);
+        renderChannelRow(first);
 
-        NotifCategory cat = it.aiCategory == null ? NotifCategory.OTHER : it.aiCategory;
+        NotifCategory cat = first.aiCategory == null
+                ? NotifCategory.OTHER : first.aiCategory;
 
-        // ---- 按钮区统一结构：最多三个按钮，各占一行 ----
-        // 第 1 个：打开（有 contentIntent 才有；否则用分类对应的主操作顶上）
-        // 第 2 个：次要操作
-        // 第 3 个：不感兴趣 / 已完成（收尾）
-        //
-        // 之前 TOOL 和 default 分支都没有「打开」按钮，用户遇到需要去 App 里
-        // 处理的工具类通知时无路可走，只能先转待办再绕一圈。
-        boolean canOpen = it.hasIntent && !it.fromTodo;
+        // ---- 第 1 个：立即办理（只处理第一条）----
+        boolean canOpen = first.hasIntent && !first.fromTodo;
         String openLabel;
         switch (cat) {
             case MARKETING: openLabel = "立即去办"; break;
@@ -692,40 +715,130 @@ public class MainActivity extends AppCompatActivity {
             case INFO:      openLabel = "立即阅读"; break;
             default:        openLabel = "打开通知"; break;
         }
-        // 聚合卡片：主按钮只跳一条，标清楚避免误解
-        if (it.isGrouped()) openLabel = "打开其中一条";
-
+        if (batch.size() > 1) openLabel = "办理第 1 条";
         if (canOpen) {
-            addPrimary(openLabel, 0xFF1F6F6F, () -> doReadNow(it));
+            addPrimary(openLabel, 0xFF1F6F6F, () -> doReadNow(first));
         } else {
-            // 没有可跳转的目标（例如从待办还原、或通知本身无 contentIntent）
             if (cat == NotifCategory.TOOL || cat == NotifCategory.OTHER) {
-                addPrimary("已完成", 0xFF1F5F3A, () -> doDone(it));
+                addPrimary("已完成本条", 0xFF1F5F3A, () -> doDone(first));
             } else {
-                addPrimary("标记已读", 0xFF1F6F6F, () -> doDone(it));
+                addPrimary("标记本条已读", 0xFF1F6F6F, () -> doDone(first));
             }
         }
 
-        // 第二个：稍后
+        // ---- 第 2 个：稍后（作用于整页）----
         String laterLabel = (cat == NotifCategory.INFO) ? "稍后读" : "稍后办";
-        addPrimary(laterLabel, 0xFF23324A, () -> doLater(it, cat == NotifCategory.INFO
-                ? Decision.TYPE_READ_LATER : Decision.TYPE_DO_LATER));
+        if (batch.size() > 1) laterLabel += "全部";
+        final int laterType = cat == NotifCategory.INFO
+                ? Decision.TYPE_READ_LATER : Decision.TYPE_DO_LATER;
+        addPrimary(laterLabel, 0xFF23324A, () -> doLaterBatch(batch, laterType));
 
-        // 第三行：已阅 + 不感兴趣，两个按钮并排一行
-        // 聚合卡片上「已阅」= 整组一次清完，按钮文案标明条数
-        String seenLabel = it.isGrouped() ? ("已阅 " + it.groupSize + " 条") : "已阅";
-        addSecondaryRow(new String[]{seenLabel, "不感兴趣"},
+        // ---- 第 3 行：已阅 + 不感兴趣（都作用于整页）----
+        addSecondaryRow(
+                new String[]{batch.size() > 1 ? "已阅全部" : "已阅",
+                             batch.size() > 1 ? "全部不感兴趣" : "不感兴趣"},
                 new int[]{0xFF23324A, 0xFF3A1F24},
                 new int[]{0xFFB0C4DE, 0xFFFF7A8A},
-                new Runnable[]{() -> doSeen(it), () -> doIgnore(it)});
+                new Runnable[]{() -> doSeenBatch(batch), () -> doIgnoreBatch(batch)});
 
-        // 所有按钮加完后统一重排一次（分散的 requestLayout 会让子 View 停在 0x0）
         layoutActions.post(() -> {
             layoutActions.requestLayout();
             rowPrimary.requestLayout();
             rowSecondary.requestLayout();
         });
+    }
 
+    /** 批量「稍后」：整页一起转为待办 */
+    private void doLaterBatch(List<NotifItem> batch, int type) {
+        if (batch == null || batch.isEmpty()) return;
+        showPlanPicker(label -> {
+            final long planAt = planTimeOf(label);
+            io.execute(() -> {
+                for (NotifItem it : batch) {
+                    if (!it.fromTodo) cancelOne(it);
+                    Decision d = buildDecision(it, type, true);
+                    d.planAt = planAt;
+                    db.upsertTodo(d);
+                }
+                ui.post(() -> {
+                    String extra = planAt <= 0 ? "" : " · " + label;
+                    toast((batch.size() > 1 ? "已加入待办 " + batch.size() + " 条"
+                            : "已加入待办") + extra);
+                    for (NotifItem it : batch) {
+                        if (it.key != null) handledThisSession.add(it.key);
+                        doneCount++;
+                    }
+                    removeBatch(batch);
+                });
+            });
+        });
+    }
+
+    /** 批量「已阅」：整页一起标记已阅并从通知栏清除 */
+    private void doSeenBatch(List<NotifItem> batch) {
+        if (batch == null || batch.isEmpty()) return;
+        io.execute(() -> {
+            for (NotifItem it : batch) {
+                if (!it.fromTodo) cancelOne(it);
+            }
+            ui.post(() -> {
+                com.nchat.util.SoundFx.playTick();
+                com.nchat.util.SoundFx.vibrateTick();
+                for (NotifItem it : batch) {
+                    if (it.fromTodo) markTodoFinished(it);
+                    recordOneDecision(it, Decision.TYPE_SEEN, false);
+                }
+                removeBatch(batch);
+            });
+        });
+    }
+
+    /** 批量「不感兴趣」：整页一起标记并清除 */
+    private void doIgnoreBatch(List<NotifItem> batch) {
+        if (batch == null || batch.isEmpty()) return;
+        io.execute(() -> {
+            for (NotifItem it : batch) {
+                if (!it.fromTodo) cancelOne(it);
+            }
+            ui.post(() -> {
+                com.nchat.util.SoundFx.playTick();
+                com.nchat.util.SoundFx.vibrateTick();
+                for (NotifItem it : batch) {
+                    if (it.fromTodo) markTodoFinished(it);
+                    recordOneDecision(it, Decision.TYPE_IGNORE, false);
+                }
+                removeBatch(batch);
+            });
+        });
+    }
+
+    /** 一次性把一批条目从界面上移除 */
+    private void removeBatch(List<NotifItem> batch) {
+        final int beforeItems = adapter.getTotalItems();
+        for (NotifItem it : batch) {
+            int pos = findPageOf(it);
+            if (pos >= 0) adapter.removeItem(pos, it);
+        }
+        if (adapter.getCount() == 0) {
+            pages.clear();
+            adapter.submit(pages);
+            showEmpty(null);
+            if (beforeItems > 0) maybeCelebrate(beforeItems);
+        } else {
+            int next = Math.min(viewPager.getCurrentItem(), adapter.getCount() - 1);
+            viewPager.setCurrentItem(next, false);
+            renderActionsFor(next);
+        }
+        updateProgress();
+    }
+
+    /** 找某条目所在的页索引，找不到返回 -1 */
+    private int findPageOf(NotifItem it) {
+        for (int i = 0; i < adapter.getCount(); i++) {
+            List<NotifItem> p = adapter.getPage(i);
+            if (p != null && p.contains(it)) return i;
+        }
+        return -1;
     }
 
     /**
@@ -853,7 +966,7 @@ public class MainActivity extends AppCompatActivity {
         if (it.fromTodo) {
             // 通知栏里已不存在，跳不了；直接视为完成
             recordDecision(it, Decision.TYPE_DONE, false, true);
-            advance();
+            advanceItem(it);
             return;
         }
         io.execute(() -> {
@@ -882,7 +995,7 @@ public class MainActivity extends AppCompatActivity {
             //
             // 顺序必须是「先 click 再 cancel」：
             // 有些 App 的 contentIntent 依赖通知本身存活，先 cancel 会让跳转失效。
-            cancelGroup(it);
+            cancelOne(it);
 
             ui.post(() -> {
                 if (!jumped) {
@@ -892,7 +1005,7 @@ public class MainActivity extends AppCompatActivity {
                             ? res.hint : res.reasonLabel();
                     toast("打不开这条通知：" + why + "（已从通知栏清除）");
                     recordDecision(it, Decision.TYPE_DONE, false, true);
-                    advance();
+                    advanceItem(it);
                     return;
                 }
                 recordDecision(it, Decision.TYPE_DONE, false, true);
@@ -938,9 +1051,10 @@ public class MainActivity extends AppCompatActivity {
             // 宽限期内没离开前台：目标页可能已打开但仍是自绘窗口，
             // 也可能压根没跳走。这里先按「未确认」记失败，
             // 紧接着的 onPause（若真的跳了）会覆盖成成功。
+            NotifItem jumped = pendingJumpItem;
             confirmJumpIfPending(false);
             justJumped = false;
-            advance();
+            advanceItem(jumped);
         }
     };
 
@@ -949,10 +1063,11 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void run() {
             if (!pendingJump) return;
+            NotifItem jumped = pendingJumpItem;
             confirmJumpIfPending(false);   // 硬超时 = 确定跳不出去，记失败
             if (isFinishing() || isDestroyed()) return;
             toast("这条通知打不开（没有可跳转的页面）");
-            advance();
+            advanceItem(jumped);
         }
     };
 
@@ -998,14 +1113,14 @@ public class MainActivity extends AppCompatActivity {
         if (it.fromTodo) {
             markTodoFinished(it);
             recordDecision(it, Decision.TYPE_DONE, false, true);
-            advance();
+            advanceItem(it);
             return;
         }
         io.execute(() -> {
-            cancelGroup(it);
+            cancelOne(it);
             ui.post(() -> {
                 recordDecision(it, Decision.TYPE_DONE, false, false);
-                advance();
+                advanceItem(it);
             });
         });
     }
@@ -1020,14 +1135,14 @@ public class MainActivity extends AppCompatActivity {
         if (it.fromTodo) {
             markTodoFinished(it);
             recordDecision(it, Decision.TYPE_SEEN, false, true);
-            advance();
+            advanceItem(it);
             return;
         }
         io.execute(() -> {
-            cancelGroup(it);
+            cancelOne(it);
             ui.post(() -> {
                 recordDecision(it, Decision.TYPE_SEEN, false, false);
-                advance();
+                advanceItem(it);
             });
         });
     }
@@ -1036,14 +1151,14 @@ public class MainActivity extends AppCompatActivity {
         if (it.fromTodo) {
             markTodoFinished(it);
             recordDecision(it, Decision.TYPE_IGNORE, false, true);
-            advance();
+            advanceItem(it);
             return;
         }
         io.execute(() -> {
-            cancelGroup(it);
+            cancelOne(it);
             ui.post(() -> {
                 recordDecision(it, Decision.TYPE_IGNORE, false, false);
-                advance();
+                advanceItem(it);
             });
         });
     }
@@ -1084,13 +1199,13 @@ public class MainActivity extends AppCompatActivity {
             final long planAt = planTimeOf(label);
             io.execute(() -> {
                 // 原通知还在通知栏的话清掉它
-                if (!it.fromTodo) cancelGroup(it);
+                if (!it.fromTodo) cancelOne(it);
                 Decision d = buildDecision(it, type, true);
                 d.planAt = planAt;
                 db.upsertTodo(d);
                 ui.post(() -> {
                     toast(planAt <= 0 ? "已加入待办" : "已加入待办 · " + label);
-                    advance();
+                    advanceItem(it);
                 });
             });
         });
@@ -1244,7 +1359,7 @@ public class MainActivity extends AppCompatActivity {
                 if (ok) {
                     recordDecision(it, Decision.TYPE_MUTED, false, true);
                     toast("已屏蔽该渠道");
-                    advance();
+                    advanceItem(it);
                 } else {
                     toast("屏蔽失败（可能渠道已不存在）");
                 }
@@ -1254,18 +1369,10 @@ public class MainActivity extends AppCompatActivity {
 
     /** 记录决策并入库 */
     private void recordDecision(NotifItem it, int type, boolean todoPending, boolean alreadyCanceled) {
-        // 聚合卡片：整组一起登记、一起记录。
-        // 否则组内其它成员没进 handledThisSession，下次刷新还会冒出来，
-        // 用户会觉得「已阅了怎么还有」。
-        // 一次用户操作只响一声。
-        // 聚合卡片内部会写 6 条记录，如果每条都响就变成机关枪了。
+        // 每次用户操作只响一声。
         com.nchat.util.SoundFx.playTick();
         com.nchat.util.SoundFx.vibrateTick();
 
-        if (it.isGrouped()) {
-            for (NotifItem m : it.allMembers()) recordOneDecision(m, type, todoPending);
-            return;
-        }
         recordOneDecision(it, type, todoPending);
     }
 
@@ -1291,33 +1398,68 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /** 批量 cancel 一个聚合组里所有还活着的通知 */
-    private void cancelGroup(NotifItem it) {
-        for (String k : it.allKeys()) {
-            DaemonClient.cancel(k);
-        }
+    /**
+     * 撤掉一条通知。
+     * 注意：现在每条是独立的，不再有「组」的概念，
+     * 所以这里只 cancel 这一条，不会牵连同页其它通知。
+     */
+    private void cancelOne(NotifItem it) {
+        if (it != null && it.key != null) DaemonClient.cancel(it.key);
     }
 
     /** 从队列中移除当前项并前进 */
-    private void advance() {
-        int pos = viewPager.getCurrentItem();
-        NotifItem cur = adapter.getItem(pos);
-        final int before = queue.size();
-        if (cur != null) {
-            queue.remove(cur);
-            doneCount++;
-        }
-        adapter.submit(queue);
+    /** 兼容旧调用：移除当前页的第一条 */
+    private void advance() { advanceItem(null); }
 
-        if (queue.isEmpty()) {
+    /**
+     * 移除某一条并刷新界面。
+     *
+     * 关键区别：**按条**移除，不再按页。
+     * 一页里可能有 6 条相似通知，处理掉一条只是少一条，整页还在，
+     * 用户继续处理剩下的。只有整页都空了，才翻到下一页。
+     *
+     * @param it 要移除的条目；传 null 表示移除当前页的第一条（底部按钮区用）
+     */
+    private void advanceItem(NotifItem it) {
+        int pos = viewPager.getCurrentItem();
+        List<NotifItem> page = adapter.getPage(pos);
+        if (page == null || page.isEmpty()) {
             showEmpty(null);
-            // 从「还有一堆」变成「清空」的这一刻才放完成音效，
-            // 单纯刷新到空列表不该庆祝。
-            if (before > 0) maybeCelebrate(before);
-        } else {
-            int next = Math.min(pos, queue.size() - 1);
+            return;
+        }
+        // 未指定时，默认操作「选中的那一条」（没选中则本页第一条）
+        NotifItem target = it != null ? it : adapter.getSelected(pos);
+        if (target == null) target = page.get(0);
+
+        // 如果传进来的条目不在当前页（例如跳转返回期间用户翻过页），
+        // 就扫一遍找到它真正所在的页，避免移除错东西。
+        if (it != null && !page.contains(it)) {
+            int found = -1;
+            for (int i = 0; i < adapter.getCount(); i++) {
+                List<NotifItem> p = adapter.getPage(i);
+                if (p != null && p.contains(it)) { found = i; break; }
+            }
+            if (found < 0) return;   // 已经不在了（可能被别的路径处理过）
+            pos = found;
+        }
+        final int beforeItems = adapter.getTotalItems();
+
+        boolean pageEmptied = adapter.removeItem(pos, target);
+        doneCount++;
+
+        if (adapter.getCount() == 0) {
+            pages.clear();
+            adapter.submit(pages);
+            showEmpty(null);
+            if (beforeItems > 0) maybeCelebrate(beforeItems);
+        } else if (pageEmptied) {
+            // 这一页清空了，翻到相邻页；夹一下索引防越界
+            int next = Math.min(pos, adapter.getCount() - 1);
             viewPager.setCurrentItem(next, false);
             renderActionsFor(next);
+        } else {
+            // 页里还有别的条目，留在原页，只刷新底部按钮区
+            renderActionsFor(pos);
         }
         updateProgress();
     }

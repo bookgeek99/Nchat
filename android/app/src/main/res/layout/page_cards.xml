@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ViewPager2 的一「页」。
+  外层必须 match_parent（ViewPager2 强制要求）。
+
+  内容居中：ScrollView 的 fillViewport + 内层 LinearLayout gravity=center。
+  这样只有一条通知时，卡片竖直居中而不是贴顶。
+  多条时，如果总高度超过一屏，居中失效、变成可滚动 —— 这正是想要的。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ScrollView
+        android:id="@+id/svPage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+
+            android:gravity="center_vertical"
+            android:orientation="vertical"
+            android:paddingStart="18dp"
+            android:paddingEnd="18dp"
+            android:paddingTop="16dp"
+            android:paddingBottom="16dp">
+
+            <!-- 「N 条相似 · 每条独立处理」 -->
+            <TextView
+                android:id="@+id/tvPageHeader"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="8dp"
+                android:layout_marginStart="2dp"
+                android:textSize="11sp"
+                android:textColor="@color/text_tertiary"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:id="@+id/llCards"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+        </LinearLayout>
+    </ScrollView>
+</FrameLayout>

@@ -13,6 +13,7 @@ import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
@@ -27,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -52,6 +54,18 @@ public class NchatDaemon {
     static final int PORT = 18765;
     static final String VERSION = "1";
     static final String OUT_DIR = "/sdcard/Develop/nchat";
+
+    /** [联动] 统一数据目录，与 recorderhub / autotrans 对齐（任务书 1.1 节）。 */
+    static final String SHARED_DIR = "/sdcard/Download/nchat";
+    static final String CHANNELS_FILE = SHARED_DIR + "/channels.json";
+    static final String SNAPSHOT_FILE = SHARED_DIR + "/mute-snapshot.json";
+    static final String STATUS_FILE = SHARED_DIR + "/status.json";
+
+    /** 渠道登记表上限（任务书 2.1 节）。 */
+    static final int MAX_CHANNELS = 500;
+    /** 快照自动恢复阈值：超时未恢复则视为异常残留（任务书 2.2 节）。 */
+    static final long SNAPSHOT_AUTO_RESTORE_MS = 30L * 60L * 1000L;
+
     static PrintWriter log;
 
     static Object inm;
@@ -60,6 +74,38 @@ public class NchatDaemon {
     static Context sysCtx;
     static final Map<String, StatusBarNotification> active = new LinkedHashMap<>();
     static volatile boolean running = true;
+
+    // ==================== [联动] 渠道登记表 ====================
+
+    /**
+     * 见过的通知渠道（任务书 2.1 节）。
+     *
+     * 注意：第三方进程无权读取其他应用的 NotificationChannel 中文名，
+     * 因此 label 退化为「最近一条通知的 title」，仅用于给用户辨认。
+     * 真正的渠道名（channelName）在 /state 里仍会尝试读取，可能为空。
+     */
+    static class ChannelEntry {
+        final String pkg;
+        final int uid;
+        final String channel;
+        int importance;      // 最近一次读到的 importance
+        String label;        // 最近一条通知的 title
+        long lastSeen;       // 最近一次见到的时间戳（ms）
+
+        ChannelEntry(String pkg, int uid, String channel) {
+            this.pkg = pkg;
+            this.uid = uid;
+            this.channel = channel;
+        }
+
+        String key() { return pkg + "|" + uid + "|" + channel; }
+    }
+
+    /** key = "pkg|uid|channel" */
+    static final Map<String, ChannelEntry> knownChannels = new LinkedHashMap<>();
+
+    /** 渠道登记表写入锁（HTTP 线程和回调线程都会碰）。 */
+    static final Object channelLock = new Object();
 
     public static void main(String[] args) {
         try {
@@ -86,7 +132,20 @@ public class NchatDaemon {
                     .getMethod("asInterface", android.os.IBinder.class).invoke(null, nms);
             p("INM ok");
 
+            // [联动] 载入历史渠道表 + 处理残留快照，然后再注册监听
+            loadChannels();
+            autoRestoreStaleSnapshot();
+
             register();
+
+            // [联动] 启动后立刻导出一次，确保 channels.json / status.json 存在
+            persistChannels();
+            writeStatus();
+
+            // [联动] 定期刷新 status.json（外部监控依赖 updatedAt 的新鲜度）
+            Thread hb = new Thread(NchatDaemon::heartbeat, "nchat-heartbeat");
+            hb.setDaemon(true);
+            hb.start();
 
             Thread t = new Thread(NchatDaemon::serve, "nchat-http");
             t.setDaemon(true);
@@ -129,6 +188,8 @@ public class NchatDaemon {
         @Override
         public void onNotificationPosted(StatusBarNotification sbn) {
             synchronized (active) { active.put(sbn.getKey(), sbn); }
+            // [联动] 登记渠道，供 /channels 导出
+            try { recordChannel(sbn); } catch (Throwable ignore) {}
             p("[CB] posted " + sbn.getKey());
         }
 
@@ -145,6 +206,12 @@ public class NchatDaemon {
             synchronized (active) {
                 active.clear();
                 if (arr != null) for (StatusBarNotification s : arr) active.put(s.getKey(), s);
+            }
+            // [联动] 启动/刷新时把现存通知的渠道也登记进来，避免要等新通知才有数据
+            if (arr != null) {
+                for (StatusBarNotification s : arr) {
+                    try { recordChannel(s); } catch (Throwable ignore) {}
+                }
             }
             p("refreshActive n=" + (arr == null ? 0 : arr.length));
         } catch (Throwable t) {
@@ -222,10 +289,15 @@ public class NchatDaemon {
         if (path.startsWith("/cancel/")) { cancel(path.substring(8)); return ok(); }
         if (path.startsWith("/click/")) return click(path.substring(7));
         if (path.startsWith("/action/")) return action(path.substring(8));
+        // [联动] 注意顺序：/mute-all 必须排在 /mute/ 之前，否则会被当成 pkg="all"
+        if (path.startsWith("/mute-all")) return muteAll();
+        if (path.startsWith("/unmute-all")) return unmuteAll();
         if (path.startsWith("/mute/")) return channelOp(path.substring(6), true);
         if (path.startsWith("/unmute/")) return channelOp(path.substring(8), false);
+        // [联动] 不带参数的 /channels = 导出全部见过的渠道；带参数保持原语义
+        if (path.equals("/channels") || path.startsWith("/channels?")) return channelsListJson();
         if (path.startsWith("/channels/")) return channelsJson(path.substring(10));
-        if (path.startsWith("/refresh")) { refreshActive(); return ok(); }
+        if (path.startsWith("/refresh")) { refreshActive(); persistChannels(); writeStatus(); return ok(); }
         if (path.startsWith("/shutdown")) {
             p("shutdown requested");
             running = false;
@@ -285,6 +357,34 @@ public class NchatDaemon {
 
             boolean sent = false;
             String lastErr = null;
+
+            // ===== send 之前，先把目标 App 拉到前台 =====
+            //
+            // Android 15+ 的 BAL 看的是「发起 PendingIntent 的那一刻，
+            // 调用方有没有可见窗口」。daemon 是后台进程，永远不满足。
+            // 等第一次 send 被拦掉再补救没有意义 —— 第二次 send
+            // 仍然是从后台发出，系统不会因为上次被拦就改变判定。
+            //
+            // 正确做法：先制造「目标 App 已在前台」这个事实，再 send。
+            // 此时 PendingIntent 的目标就是当前前台包，
+            // BAL 的判定条件不再成立。
+            //
+            // 另一个必须避开的坑：目标 App 已经在前台时，
+            // 再调 bringPackageToFront 会把它拉回首页，
+            // 把即将打开的详情页顶掉。所以先判断，已在前台就跳过。
+            String targetPkg0 = null;
+            try { targetPkg0 = sbn.getPackageName(); } catch (Throwable ignore) {}
+            boolean alreadyFront = targetPkg0 != null && before != null
+                    && before.startsWith(targetPkg0 + "/");
+            if (targetPkg0 != null && !targetPkg0.isEmpty() && !alreadyFront) {
+                long w0 = System.currentTimeMillis();
+                boolean warmed = bringPackageToFront(targetPkg0, 1500);
+                long wCost = System.currentTimeMillis() - w0;
+                diag.append(" prewarm=").append(warmed).append("/").append(wCost).append("ms");
+                p("click prewarm " + targetPkg0 + " -> " + warmed + " in " + wCost + "ms");
+            } else if (alreadyFront) {
+                diag.append(" prewarm=skip(already-front)");
+            }
 
             // 方案 1：ActivityOptions 明确允许后台启动（API 34+）
             if (android.os.Build.VERSION.SDK_INT >= 34) {
@@ -360,25 +460,17 @@ public class NchatDaemon {
             String afterPkg = after == null ? "" : after.split("/")[0];
             diag.append(" after=").append(after).append(" cost=").append(cost).append("ms");
 
-            // ---- 第二轮：没跳过去就「先拉起目标 App，再重发一次」 ----
+            // ---- 第二轮：重发一次 ----
             //
-            // 这是绕开 Android 15 BAL 的核心手段。
-            // BAL 拦的是「后台进程 send 一个会启动 Activity 的 PendingIntent」。
-            // 我们先自己把目标包推到前台，此时再 send，
-            // 系统的判定条件（调用方是否有可见窗口）就不再成立，可以放行。
-            //
-            // 代价：会先看到目标 App 的首页闪一下，再进到通知对应的详情页。
-            // 这个闪屏是故意接受的 —— 用体验上的一点点抖动，换跳转成功率。
-            if (!jumped && before != null) {
-                String warmPkg = null;
-                try { warmPkg = sbn.getPackageName(); } catch (Throwable ignore) {}
-                if (warmPkg != null && !warmPkg.isEmpty()) {
-                    long w0 = System.currentTimeMillis();
-                    boolean warmed = bringPackageToFront(warmPkg, 1800);
-                    long wCost = System.currentTimeMillis() - w0;
-                    diag.append(" warmup=").append(warmed).append("/").append(wCost).append("ms");
-
-                    if (warmed) {
+            // 注意：这里**不再**调用 bringPackageToFront。
+            // 前面已经在 send 之前 warmup 过了。如果这里再拉一次，
+            // 会把刚打开的详情页重新顶回 App 首页 ——
+            // 这正是之前「有时候反而进不去 / 回到首页」的元凶。
+            // 现在只做一件事：目标包已在桌面的前提下，再 send 一次。
+            if (!jumped && targetPkg0 != null && !targetPkg0.isEmpty()) {
+                {
+                    {
+                        boolean warmed = true;
                         // 重发一次 contentIntent
                         try {
                             if (android.os.Build.VERSION.SDK_INT >= 34) {
@@ -837,6 +929,439 @@ public class NchatDaemon {
             return sb.append("]}").toString();
         } catch (Throwable t) {
             return error(rootMsg(t));
+        }
+    }
+
+    // ==================== [联动] 渠道登记与批量静音 ====================
+
+    /**
+     * 从一条通知里登记它的渠道（任务书 2.1 节）。
+     * 只在内存里累积，落盘由 {@link #persistChannels()} 负责。
+     */
+    static void recordChannel(StatusBarNotification sbn) {
+        String pkg = sbn.getPackageName();
+        if (pkg == null || pkg.isEmpty()) return;
+        Notification n = sbn.getNotification();
+        if (n == null) return;
+        String cid = channelId(n);
+        if (cid == null || cid.isEmpty()) return;
+        int uid = sbn.getUid();
+
+        String title = "";
+        try { title = cs(n.extras.getCharSequence(Notification.EXTRA_TITLE)); } catch (Throwable ignore) {}
+        if (title == null) title = "";
+        if (title.length() > 60) title = title.substring(0, 60);
+
+        synchronized (channelLock) {
+            String k = pkg + "|" + uid + "|" + cid;
+            ChannelEntry e = knownChannels.get(k);
+            if (e == null) {
+                e = new ChannelEntry(pkg, uid, cid);
+                knownChannels.put(k, e);
+                if (knownChannels.size() > MAX_CHANNELS) {
+                    String oldestKey = null;
+                    long oldest = Long.MAX_VALUE;
+                    for (Map.Entry<String, ChannelEntry> en : knownChannels.entrySet()) {
+                        long ls = en.getValue().lastSeen;
+                        if (ls < oldest) { oldest = ls; oldestKey = en.getKey(); }
+                    }
+                    if (oldestKey != null && !oldestKey.equals(k)) knownChannels.remove(oldestKey);
+                }
+            }
+            e.lastSeen = System.currentTimeMillis();
+            if (!title.isEmpty()) e.label = title;
+            NotificationChannel ch = tryFindChannel(pkg, uid, cid);
+            if (ch != null) e.importance = ch.getImportance();
+        }
+    }
+
+    /** findChannel 的静默版本，失败返回 null。 */
+    static NotificationChannel tryFindChannel(String pkg, int uid, String cid) {
+        try { return findChannel(pkg, uid, cid); } catch (Throwable t) { return null; }
+    }
+
+    /** 把渠道登记表写盘。 */
+    static void persistChannels() {
+        try {
+            ensureSharedDir();
+            StringBuilder sb = new StringBuilder("{\"updatedAt\":\"");
+            sb.append(esc(isoNow())).append("\",\"channels\":[");
+            boolean first = true;
+            synchronized (channelLock) {
+                for (ChannelEntry e : knownChannels.values()) {
+                    if (!first) sb.append(',');
+                    first = false;
+                    sb.append("{\"pkg\":\"").append(esc(e.pkg)).append("\",");
+                    sb.append("\"uid\":").append(e.uid).append(',');
+                    sb.append("\"channel\":\"").append(esc(e.channel)).append("\",");
+                    sb.append("\"label\":\"").append(esc(e.label == null ? "" : e.label)).append("\",");
+                    sb.append("\"importance\":").append(e.importance).append(',');
+                    sb.append("\"muted\":").append(e.importance <= 0).append(',');
+                    sb.append("\"lastSeen\":").append(e.lastSeen).append('}');
+                }
+            }
+            sb.append("]}");
+            writeAtomic(CHANNELS_FILE, sb.toString());
+        } catch (Throwable t) {
+            p("persistChannels FAILED " + t);
+        }
+    }
+
+    /** GET /channels —— 导出见过的渠道列表（任务书 2.1 节）。 */
+    static String channelsListJson() {
+        try {
+            int cnt;
+            synchronized (channelLock) { cnt = knownChannels.size(); }
+            StringBuilder sb = new StringBuilder("{\"ok\":true,\"count\":");
+            sb.append(cnt).append(",\"channels\":[");
+            boolean first = true;
+            synchronized (channelLock) {
+                for (ChannelEntry e : knownChannels.values()) {
+                    if (!first) sb.append(',');
+                    first = false;
+                    sb.append("{\"pkg\":\"").append(esc(e.pkg)).append("\",");
+                    sb.append("\"uid\":").append(e.uid).append(',');
+                    sb.append("\"channel\":\"").append(esc(e.channel)).append("\",");
+                    sb.append("\"label\":\"").append(esc(e.label == null ? "" : e.label)).append("\",");
+                    sb.append("\"importance\":").append(e.importance).append(',');
+                    sb.append("\"muted\":").append(e.importance <= 0).append(',');
+                    sb.append("\"lastSeen\":").append(e.lastSeen).append('}');
+                }
+            }
+            return sb.append("]}").toString();
+        } catch (Throwable t) {
+            return error(rootMsg(t));
+        }
+    }
+
+    /** 设置单个渠道的实际 importance，返回是否成功。 */
+    static boolean applyImportance(String pkg, int uid, String cid, int importance) {
+        try {
+            NotificationChannel target = findChannel(pkg, uid, cid);
+            if (target == null) return false;
+            target.setImportance(importance);
+            try {
+                Method u = inm.getClass().getMethod("updateNotificationChannelForPackage",
+                        String.class, int.class, NotificationChannel.class);
+                u.invoke(inm, pkg, uid, target);
+                return true;
+            } catch (Throwable t1) {
+                Method u = inm.getClass().getMethod("updateNotificationChannelFromPrivilegedListener",
+                        Class.forName("android.service.notification.INotificationListener"),
+                        String.class, Class.forName("android.os.UserHandle"), NotificationChannel.class);
+                u.invoke(inm, wrapper, pkg, Process.myUserHandle(), target);
+                return true;
+            }
+        } catch (Throwable t) {
+            p("applyImportance FAILED " + pkg + "/" + cid + " -> " + rootMsg(t));
+            return false;
+        }
+    }
+
+    /**
+     * GET /mute-all —— 把 importance>=3 的渠道置为静音（任务书 2.2 节）。
+     * 幂等：快照已存在则不覆盖，保住原始 importance。
+     */
+    static String muteAll() {
+        try {
+            ensureSharedDir();
+            boolean hasSnapshot = new File(SNAPSHOT_FILE).exists();
+
+            // [幂等] 快照已存在说明上一轮静音还没恢复：直接返回，绝不重复静音。
+            // 否则会把「已静音的渠道」再次记进新快照，原 importance 就永久丢了。
+            if (hasSnapshot) {
+                int known;
+                synchronized (channelLock) { known = knownChannels.size(); }
+                p("muteAll: snapshot exists -> idempotent skip (known=" + known + ")");
+                writeStatus();
+                return "{\"ok\":true,\"muted\":0,\"skipped\":" + known
+                        + ",\"failed\":0,\"idempotent\":true"
+                        + ",\"snapshot\":\"" + esc(SNAPSHOT_FILE) + "\"}";
+            }
+
+            int muted = 0, skipped = 0, failed = 0;
+
+            List<String[]> targets = new ArrayList<>();
+            synchronized (channelLock) {
+                for (ChannelEntry e : knownChannels.values()) {
+                    targets.add(new String[]{e.pkg, String.valueOf(e.uid), e.channel});
+                }
+            }
+            p("muteAll: candidates=" + targets.size() + " snapshotExists=" + hasSnapshot);
+
+            StringBuilder snap = new StringBuilder();
+            snap.append("{\"createdAt\":\"").append(esc(isoNow())).append("\",\"channels\":[");
+            boolean firstSnap = true;
+
+            for (String[] t : targets) {
+                int uid = Integer.parseInt(t[1]);
+                NotificationChannel ch = tryFindChannel(t[0], uid, t[2]);
+                if (ch == null) { failed++; continue; }
+                int cur = ch.getImportance();
+                if (cur <= 0) { skipped++; continue; }
+                if (cur < 3) { skipped++; continue; }
+                if (!applyImportance(t[0], uid, t[2], 0)) { failed++; continue; }
+                muted++;
+                if (!firstSnap) snap.append(',');
+                firstSnap = false;
+                snap.append("{\"pkg\":\"").append(esc(t[0])).append("\",");
+                snap.append("\"uid\":").append(t[1]).append(',');
+                snap.append("\"channel\":\"").append(esc(t[2])).append("\",");
+                snap.append("\"importance\":").append(cur).append('}');
+            }
+            snap.append("]}");
+
+            if (!hasSnapshot && muted > 0) {
+                writeAtomic(SNAPSHOT_FILE, snap.toString());
+                p("muteAll: snapshot written (" + muted + ")");
+            } else if (hasSnapshot) {
+                p("muteAll: snapshot exists, kept");
+            }
+
+            persistChannels();
+            writeStatus();
+            return "{\"ok\":true,\"muted\":" + muted + ",\"skipped\":" + skipped
+                    + ",\"failed\":" + failed
+                    + ",\"snapshot\":\"" + esc(SNAPSHOT_FILE) + "\"}";
+        } catch (Throwable t) {
+            p("muteAll FAILED " + rootMsg(t));
+            return error(rootMsg(t));
+        }
+    }
+
+    /** GET /unmute-all —— 只恢复快照里记录的渠道（任务书 2.2 节）。 */
+    static String unmuteAll() {
+        try {
+            String r = restoreFromSnapshot();
+            persistChannels();
+            writeStatus();
+            return r;
+        } catch (Throwable t) {
+            p("unmuteAll FAILED " + rootMsg(t));
+            return error(rootMsg(t));
+        }
+    }
+
+    /** 按快照恢复并删除快照。返回 {"ok":true,"restored":N,"failed":M} */
+    static String restoreFromSnapshot() {
+        File f = new File(SNAPSHOT_FILE);
+        if (!f.exists()) {
+            p("restore: no snapshot");
+            return "{\"ok\":true,\"restored\":0,\"failed\":0}";
+        }
+        int restored = 0, failed = 0;
+        try {
+            String json = readFile(f);
+            int idx = 0;
+            while (true) {
+                int s = json.indexOf("{\"pkg\":\"", idx);
+                if (s < 0) break;
+                int e = json.indexOf('}', s);
+                if (e < 0) break;
+                String obj = json.substring(s, e + 1);
+                idx = e + 1;
+                String pkg = grabStr(obj, "pkg");
+                int uid = grabInt(obj, "uid");
+                String cid = grabStr(obj, "channel");
+                int imp = grabInt(obj, "importance");
+                if (pkg == null || cid == null) { failed++; continue; }
+                if (applyImportance(pkg, uid, cid, imp)) restored++; else failed++;
+            }
+            p("restore: restored=" + restored + " failed=" + failed);
+        } catch (Throwable t) {
+            p("restore FAILED " + rootMsg(t));
+        } finally {
+            try { f.delete(); } catch (Throwable ignore) {}
+        }
+        return "{\"ok\":true,\"restored\":" + restored + ",\"failed\":" + failed + "}";
+    }
+
+    static String grabStr(String obj, String key) {
+        String pat = "\"" + key + "\":\"";
+        int i = obj.indexOf(pat);
+        if (i < 0) return null;
+        i += pat.length();
+        int j = obj.indexOf('"', i);
+        if (j < 0) return null;
+        return obj.substring(i, j);
+    }
+
+    static int grabInt(String obj, String key) {
+        String pat = "\"" + key + "\":";
+        int i = obj.indexOf(pat);
+        if (i < 0) return 0;
+        i += pat.length();
+        int j = i;
+        while (j < obj.length() && (Character.isDigit(obj.charAt(j)) || obj.charAt(j) == '-')) j++;
+        if (j == i) return 0;
+        try { return Integer.parseInt(obj.substring(i, j)); } catch (Throwable t) { return 0; }
+    }
+
+    static long grabLong(String obj, String key) {
+        String pat = "\"" + key + "\":";
+        int i = obj.indexOf(pat);
+        if (i < 0) return 0L;
+        i += pat.length();
+        int j = i;
+        while (j < obj.length() && (Character.isDigit(obj.charAt(j)) || obj.charAt(j) == '-')) j++;
+        if (j == i) return 0L;
+        try { return Long.parseLong(obj.substring(i, j)); } catch (Throwable t) { return 0L; }
+    }
+
+    /** daemon 启动时调用：快照残留超过 30 分钟则自动恢复一次（任务书 2.2 节）。 */
+    static void autoRestoreStaleSnapshot() {
+        try {
+            File f = new File(SNAPSHOT_FILE);
+            if (!f.exists()) return;
+            long age = System.currentTimeMillis() - f.lastModified();
+            p("snapshot exists, age=" + (age / 1000) + "s");
+            if (age > SNAPSHOT_AUTO_RESTORE_MS) {
+                p("snapshot stale (>30min) -> auto restore");
+                restoreFromSnapshot();
+            }
+        } catch (Throwable t) {
+            p("autoRestoreStaleSnapshot FAILED " + t);
+        }
+    }
+
+    /** 从 channels.json 载入上次的登记表，让 daemon 重启后能立刻响应 /channels。 */
+    static void loadChannels() {
+        try {
+            File f = new File(CHANNELS_FILE);
+            if (!f.exists()) return;
+            String json = readFile(f);
+            int idx = 0, n = 0;
+            synchronized (channelLock) {
+                while (true) {
+                    int s = json.indexOf("{\"pkg\":\"", idx);
+                    if (s < 0) break;
+                    int e = json.indexOf('}', s);
+                    if (e < 0) break;
+                    String obj = json.substring(s, e + 1);
+                    idx = e + 1;
+                    String pkg = grabStr(obj, "pkg");
+                    String cid = grabStr(obj, "channel");
+                    if (pkg == null || cid == null) continue;
+                    ChannelEntry en = new ChannelEntry(pkg, grabInt(obj, "uid"), cid);
+                    en.label = grabStr(obj, "label");
+                    en.importance = grabInt(obj, "importance");
+                    en.lastSeen = grabLong(obj, "lastSeen");
+                    knownChannels.put(en.key(), en);
+                    n++;
+                    if (knownChannels.size() >= MAX_CHANNELS) break;
+                }
+            }
+            p("loadChannels: " + n + " entries");
+        } catch (Throwable t) {
+            p("loadChannels FAILED " + t);
+        }
+    }
+
+    // ==================== [联动] 文件与状态工具 ====================
+
+    // ==================== [联动] 心跳 ====================
+
+    /**
+     * 每 30 秒刷新一次 channels.json / status.json。
+     * 外部监控（验收第 6 项）要求 updatedAt 在 5 分钟内保持新鲜。
+     */
+    static void heartbeat() {
+        while (running) {
+            try { Thread.sleep(30000L); } catch (InterruptedException ignore) {}
+            if (!running) break;
+            try {
+                persistChannels();
+                writeStatus();
+            } catch (Throwable t) {
+                p("heartbeat FAILED " + t);
+            }
+        }
+    }
+
+    static void ensureSharedDir() {
+        try { new File(SHARED_DIR).mkdirs(); } catch (Throwable ignore) {}
+    }
+
+    /** 先写临时文件再 rename，避免外部读到半个文件。 */
+    static void writeAtomic(String path, String content) {
+        try {
+            File target = new File(path);
+            File dir = target.getParentFile();
+            if (dir != null) dir.mkdirs();
+            File tmp = new File(path + ".tmp");
+            FileOutputStream fos = new FileOutputStream(tmp);
+            fos.write(content.getBytes("UTF-8"));
+            fos.flush();
+            fos.getFD().sync();
+            fos.close();
+            if (target.exists()) target.delete();
+            if (!tmp.renameTo(target)) {
+                FileOutputStream f2 = new FileOutputStream(target);
+                f2.write(content.getBytes("UTF-8"));
+                f2.close();
+                tmp.delete();
+            }
+        } catch (Throwable t) {
+            p("writeAtomic FAILED " + path + " -> " + t);
+        }
+    }
+
+    static String readFile(File f) throws Exception {
+        byte[] buf = new byte[(int) f.length()];
+        FileInputStream in = new FileInputStream(f);
+        try {
+            int off = 0;
+            while (off < buf.length) {
+                int r = in.read(buf, off, buf.length - off);
+                if (r < 0) break;
+                off += r;
+            }
+        } finally { in.close(); }
+        return new String(buf, "UTF-8");
+    }
+
+    /** ISO 8601 带时区偏移，如 2026-11-09T23:40:00+08:00 */
+    static String isoNow() { return isoAt(System.currentTimeMillis()); }
+
+    static String isoAt(long ms) {
+        try {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US);
+            return sdf.format(new Date(ms));
+        } catch (Throwable t) {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
+            return sdf.format(new Date(ms));
+        }
+    }
+
+    /** 写 /sdcard/Download/nchat/status.json（任务书 2.3 节）。 */
+    static void writeStatus() {
+        try {
+            ensureSharedDir();
+            int known, muted = 0;
+            synchronized (channelLock) {
+                known = knownChannels.size();
+                for (ChannelEntry e : knownChannels.values()) if (e.importance <= 0) muted++;
+            }
+            long lastAt = 0;
+            synchronized (active) {
+                for (StatusBarNotification s : active.values()) {
+                    if (s.getPostTime() > lastAt) lastAt = s.getPostTime();
+                }
+            }
+            StringBuilder sb = new StringBuilder("{");
+            sb.append("\"app\":\"nchat\",");
+            sb.append("\"daemonUp\":true,");
+            sb.append("\"version\":\"").append(VERSION).append("\",");
+            sb.append("\"api\":").append(android.os.Build.VERSION.SDK_INT).append(',');
+            sb.append("\"channelsKnown\":").append(known).append(',');
+            sb.append("\"mutedCount\":").append(muted).append(',');
+            sb.append("\"snapshotActive\":").append(new File(SNAPSHOT_FILE).exists()).append(',');
+            sb.append("\"lastNotificationAt\":").append(lastAt > 0 ? "\"" + esc(isoAt(lastAt)) + "\"" : "null").append(',');
+            sb.append("\"updatedAt\":\"").append(esc(isoNow())).append('"');
+            sb.append('}');
+            writeAtomic(STATUS_FILE, sb.toString());
+        } catch (Throwable t) {
+            p("writeStatus FAILED " + t);
         }
     }
 
